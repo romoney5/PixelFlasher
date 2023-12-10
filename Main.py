@@ -119,7 +119,7 @@ class PixelFlasher(wx.Frame):
         init_db()
         wx.Frame.__init__(self, parent, -1, title, size=(self.config.width, self.config.height),
                           style=wx.DEFAULT_FRAME_STYLE | wx.NO_FULL_REPAINT_ON_RESIZE | wx.SYSTEM_MENU | wx.CLOSE_BOX)
-
+        self.SetBackgroundColour(wx.Colour(48, 48, 48))
         # Base first run size on resolution.
         if self.config.first_run:
             x = int((self.CharWidth * self.config.width) / 11)
