@@ -2486,7 +2486,7 @@ add_hosts_module
         if self._magisk_apks is None:
             try:
                 apks = []
-                mlist = ['stable', 'beta', 'canary', 'debug', 'delta canary', 'delta debug', 'special 25203', "special 26401"]
+                mlist = ['stable', 'beta', 'canary', 'debug', 'delta canary', 'delta debug', 'special 25203', "special 26401", "zygote64_32 stable", "zygote64_32 beta", "zygote64_32 canary", "zygote64_32 debug"]
                 for i in mlist:
                     apk = self.get_magisk_apk_details(i)
                     if apk:
