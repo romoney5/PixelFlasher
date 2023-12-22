@@ -91,6 +91,8 @@ class DropDownButton(wx.BitmapButton):
         super().__init__(parent, id, bitmap, pos, size, style)
         self.Bind(wx.EVT_BUTTON, self.OnButtonClick)
         self.popup_menu = wx.Menu()
+        self.SetBackgroundColour(wx.Colour(48, 52, 52))
+        self.SetForegroundColour(wx.Colour(255, 255, 255))
 
     def OnButtonClick(self, event):
         self.PopupMenu(self.popup_menu)
@@ -428,6 +430,8 @@ class PixelFlasher(wx.Frame):
         self.statusBar.SetStatusWidths([-2, -1])
         status_text = f"Welcome to PixelFlasher {VERSION}"
         self.statusBar.SetStatusText(status_text, 0)
+        self.statusBar.SetBackgroundColour(wx.Colour(48, 52, 52))
+        self.statusBar.SetForegroundColour(wx.Colour(255, 255, 255))
 
     # -----------------------------------------------
     #                  _build_toolbar
@@ -440,7 +444,9 @@ class PixelFlasher(wx.Frame):
             tb = self.CreateToolBar(flags)
             # tb = MultiLineToolbar(self, flags)  # Use the custom MultiLineToolbar class
             self.tb = tb
-
+            self.tb.SetBackgroundColour(wx.Colour(48, 52, 52))
+            self.tb.SetForegroundColour(wx.Colour(255, 255, 255))
+            
             tsize = (64, 64)
             null_bmp = wx.BitmapBundle(wx.NullBitmap)
             tb.SetToolBitmapSize(tsize)
