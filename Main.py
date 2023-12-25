@@ -1305,7 +1305,7 @@ class PixelFlasher(wx.Frame):
             pathname = fileDialog.GetPath()
             print(f"\nSelected {pathname} for installation.")
             try:
-                dlg = wx.MessageDialog(None, "Do you want to set the ownership to Play Store Market?\nNote: Android auto apps require that they be installed from the Play Market.",'APK Installation',wx.YES_NO | wx.NO_DEFAULT | wx.CANCEL | wx.ICON_EXCLAMATION)
+                dlg = wx.MessageDialog(None, "Do you want to set the ownership to Play Store?\nNote: Android auto apps require that they be installed from the Play Store.",'APK Installation',wx.YES_NO | wx.NO_DEFAULT | wx.CANCEL | wx.ICON_EXCLAMATION)
             except Exception:
                 traceback.print_exc()
                 return
@@ -1314,9 +1314,9 @@ class PixelFlasher(wx.Frame):
                 self._on_spin('start')
                 if result == wx.ID_YES:
                     puml("note right:Set ownership to Play Store;\n")
-                    device.install_apk(pathname, fastboot_included=True, owner_playstore=True)
+                    device.install_apk(pathname, fastboot_included=True, owner_playstore=True, ignore_low_target_sdk=True)
                 elif result == wx.ID_NO:
-                    device.install_apk(pathname, fastboot_included=True)
+                    device.install_apk(pathname, fastboot_included=True, ignore_low_target_sdk=True)
                 else:
                     puml("note right:Cancelled APK installation;\n")
                     print("User cancelled apk installation.")
