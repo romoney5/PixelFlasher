@@ -18,7 +18,7 @@ on:
 
 jobs:
   build_windows:
-    if: ${{ github.actor == 'badabing2005' }}
+    if: ${{ github.actor == 'romoney5' }}
     # https://docs.github.com/en/actions/using-github-hosted-runners/about-github-hosted-runners
     runs-on: windows-latest
 
