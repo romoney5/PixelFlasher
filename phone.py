@@ -2658,7 +2658,7 @@ This is a special Magisk build\n\n
     # ----------------------------------------------------------------------------
     #                               Method install_apk
     # ----------------------------------------------------------------------------
-    def install_apk(self, app, fastboot_included = False, owner_playstore = False):
+    def install_apk(self, app, fastboot_included = False, owner_playstore = False, ignore_low_target_sdk = False):
         try:
             if self.mode == 'adb' and get_adb():
                 print(f"Installing {app} on device ...")
@@ -2666,8 +2666,12 @@ This is a special Magisk build\n\n
                 if owner_playstore:
                     puml("note right:Set owner to be Play Store;\n")
                     theCmd = f"\"{get_adb()}\" -s {self.id} install -i \"com.android.vending\" -r \"{app}\""
+                    if ignore_low_target_sdk:
+                        theCmd = f"\"{get_adb()}\" -s {self.id} install -i \"com.android.vending\" --bypass-low-target-sdk-block -r \"{app}\""
                 else:
                     theCmd = f"\"{get_adb()}\" -s {self.id} install -r \"{app}\""
+                    if ignore_low_target_sdk:
+                        theCmd = f"\"{get_adb()}\" -s {self.id} install --bypass-low-target-sdk-block -r \"{app}\""
                 debug(theCmd)
                 res = run_shell(theCmd)
                 if res.returncode != 0:
