@@ -12,6 +12,7 @@ import sys
 import time
 import traceback
 import webbrowser
+import subprocess
 from datetime import datetime
 from urllib.parse import urlparse
 
@@ -457,6 +458,12 @@ class PixelFlasher(wx.Frame):
                 self.Bind(wx.EVT_TOOL, self.OnToolClick, id=5)
                 self.Bind(wx.EVT_TOOL_RCLICKED, self.OnToolRClick, id=5)
 
+            # Install APK
+            if self.config.toolbar['visible']['edit_am_apk']:
+                tb.AddTool(toolId=5, label="Edit APK Manifest", bitmap=images.install_apk_64.GetBitmap(), bmpDisabled=null_bmp, kind=wx.ITEM_NORMAL, shortHelp="Edit the manifest of an APK", longHelp="Use apktool to edit the AndroidManifest.xml of an APK", clientData=None)
+                self.Bind(wx.EVT_TOOL, self.OnToolClick, id=6)
+                self.Bind(wx.EVT_TOOL_RCLICKED, self.OnToolRClick, id=6)
+
             # Package Manager
             if self.config.toolbar['visible']['package_manager']:
                 tb.AddTool(toolId=8, label="App Manager", bitmap=images.packages_64.GetBitmap(), bmpDisabled=null_bmp, kind=wx.ITEM_NORMAL, shortHelp="Package Manager", longHelp="Manage Apps / Packages", clientData=None)
@@ -650,6 +657,8 @@ class PixelFlasher(wx.Frame):
         id = event.GetId()
         if id == 5:
             self._on_install_apk(event)
+        if id == 6:
+            self._on_edit_am_apk(event)
         elif id == 8:
             self._on_package_manager(event)
         elif id == 10:
@@ -807,6 +816,10 @@ class PixelFlasher(wx.Frame):
         self.install_apk = device_menu.Append(wx.ID_ANY, "Install APK", "Install APK")
         self.install_apk.SetBitmap(images.install_apk_24.GetBitmap())
         self.Bind(wx.EVT_MENU, self._on_install_apk, self.install_apk)
+        # Install APK
+        self.edit_am_apk = device_menu.Append(wx.ID_ANY, "Edit APK Manifest", "Edit APK Manifest")
+        self.install_apk.SetBitmap(images.install_apk_24.GetBitmap())
+        self.Bind(wx.EVT_MENU, self._on_edit_am_apk, self.edit_am_apk)
         # Bulk Install APK
         self.bulk_install_apk = device_menu.Append(wx.ID_ANY, "Bulk Install APK", "Bulk Install APK")
         self.bulk_install_apk.SetBitmap(images.install_apk_24.GetBitmap())
@@ -1324,6 +1337,53 @@ class PixelFlasher(wx.Frame):
                 traceback.print_exc()
                 wx.LogError(f"Cannot install file '{pathname}'.")
             self._on_spin('stop')
+
+    # -----------------------------------------------
+    #                  _on_install_apk
+    # -----------------------------------------------
+    def _on_edit_am_apk(self, event):
+        device = get_phone()
+        if not device:
+            print("ERROR: Please select a device before attempting APK Installation")
+            self.toast("APK Install", "ERROR: Please select a device before attempting APK Installation.")
+            return
+
+        with wx.FileDialog(self, "Select APK file to install (apktool.jar must be in the same directory)", '', '', wildcard="Android Applications (*.*.apk)|*.apk", style=wx.FD_OPEN) as fileDialog:
+            if fileDialog.ShowModal() == wx.ID_CANCEL:
+                return     # the user changed their mind
+            # save the current contents in the file
+            pathname = fileDialog.GetPath()
+            print(f"\nSelected {pathname} for editing.")
+            apktool_path = os.path.join(os.path.dirname(selected_dir), "apktool.jar")
+            output_directory = pathname + "_decompiled"
+            try:
+                cmd = f"java -jar {apktool_path} d -f {apk_path} -o {output_directory}"
+                subprocess.run(cmd, shell=True)
+                manifest_path = os.path.join(output_directory, "AndroidManifest.xml")
+                if os.path.exists(manifest_path):
+                    subprocess.run(["xdg-open", manifest_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    print("Opened manifest file")
+                else:
+                    print("Did not open manifest file")
+                #dlg = wx.MessageDialog(None, "Do you want to set the ownership to Play Store?\nNote: Android auto apps require that they be installed from the Play Store.",'APK Installation',wx.YES_NO | wx.NO_DEFAULT | wx.CANCEL | wx.ICON_EXCLAMATION)
+            except Exception:
+                traceback.print_exc()
+                return
+            # result = dlg.ShowModal()
+            # try:
+            #     self._on_spin('start')
+            #     if result == wx.ID_YES:
+            #         puml("note right:Set ownership to Play Store;\n")
+            #         device.install_apk(pathname, fastboot_included=True, owner_playstore=True, ignore_low_target_sdk=True)
+            #     elif result == wx.ID_NO:
+            #         device.install_apk(pathname, fastboot_included=True, ignore_low_target_sdk=True)
+            #     else:
+            #         puml("note right:Cancelled APK installation;\n")
+            #         print("User cancelled apk installation.")
+            # except IOError:
+            #     traceback.print_exc()
+            #     wx.LogError(f"Cannot install file '{pathname}'.")
+            # self._on_spin('stop')
 
     # -----------------------------------------------
     #                  _on_bulk_install_apk
