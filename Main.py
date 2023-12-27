@@ -92,8 +92,8 @@ class DropDownButton(wx.BitmapButton):
         super().__init__(parent, id, bitmap, pos, size, style)
         self.Bind(wx.EVT_BUTTON, self.OnButtonClick)
         self.popup_menu = wx.Menu()
-        self.SetBackgroundColour(wx.Colour(48, 52, 52))
-        self.SetForegroundColour(wx.Colour(255, 255, 255))
+        #self.SetBackgroundColour(wx.Colour(48, 52, 52))
+        #self.SetForegroundColour(wx.Colour(255, 255, 255))
 
     def OnButtonClick(self, event):
         self.PopupMenu(self.popup_menu)
@@ -1354,10 +1354,10 @@ class PixelFlasher(wx.Frame):
             # save the current contents in the file
             pathname = fileDialog.GetPath()
             print(f"\nSelected {pathname} for editing.")
-            apktool_path = os.path.join(os.path.dirname(selected_dir), "apktool.jar")
+            apktool_path = os.path.join(os.path.dirname(pathname), "apktool.jar")
             output_directory = pathname + "_decompiled"
             try:
-                cmd = f"java -jar {apktool_path} d -f {apk_path} -o {output_directory}"
+                cmd = f"java -jar {apktool_path} d -f {pathname} -o {output_directory}"
                 subprocess.run(cmd, shell=True)
                 manifest_path = os.path.join(output_directory, "AndroidManifest.xml")
                 if os.path.exists(manifest_path):
