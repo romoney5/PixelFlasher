@@ -12,8 +12,8 @@ import sys
 import time
 import traceback
 import webbrowser
-import subprocess
-from datetime import datetime
+import threading
+from datetime import datetime, timedelta
 from urllib.parse import urlparse
 
 import darkdetect
@@ -25,6 +25,7 @@ import wx.lib.mixins.inspection
 from packaging.version import parse
 
 import images as images
+import cProfile, pstats
 
 with contextlib.suppress(Exception):
     ctypes.windll.shcore.SetProcessDpiAwareness(True)
@@ -53,6 +54,7 @@ locale.setlocale(locale.LC_ALL, 'C')
 # For troubleshooting, set inspector = True
 inspector = False
 dont_initialize = False
+do_profiling = False
 
 # Declare global_args at the global scope
 global_args = None
@@ -77,12 +79,110 @@ class RedirectText():
 
         if not self.logfile.closed:
             self.logfile.write(string)
+            self.logfile.flush()
 
-    # noinspection PyMethodMayBeStatic
+    # # noinspection PyMethodMayBeStatic
+    # def flush(self):
+    #     # noinspection PyStatementEffect
+    #     None
+
     def flush(self):
-        # noinspection PyStatementEffect
-        None
+        if not self.logfile.closed:
+            self.logfile.flush()
 
+    def close(self):
+        if not self.logfile.closed:
+            self.logfile.close()
+
+# ============================================================================
+#                               Class FilePickerComboBox
+# ============================================================================
+class FilePickerComboBox(wx.Panel):
+    def __init__(self, parent, dialog_title="Select a file", wildcard="All files (*.*)|*.*"):
+        super(FilePickerComboBox, self).__init__(parent)
+
+        self.history_file = get_device_images_history_file_path()
+        self.dialog_title = dialog_title
+        self.wildcard = wildcard
+        self.history = []
+
+        self.combo_box = wx.ComboBox(self, wx.ID_ANY, style=wx.CB_READONLY)
+        self.browse_button = wx.Button(self, wx.ID_ANY, 'Browse')
+
+        sizer = wx.BoxSizer(wx.HORIZONTAL)
+        sizer.Add(self.combo_box, 1, wx.EXPAND)
+        sizer.Add(self.browse_button, 0, wx.EXPAND)
+        self.SetSizer(sizer)
+
+        self.browse_button.Bind(wx.EVT_BUTTON, self.on_browse)
+
+        if os.path.exists(self.history_file):
+            try:
+                with open(self.history_file, 'r') as f:
+                    self.history = json.load(f)
+                    self.combo_box.SetItems(self.history)
+            except Exception as e:
+                print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: encountered an exception during device_images_history_file loading.")
+                print(f"Exception: {e}")
+                print("Deleting the device_images_history_file to recover ...")
+                os.remove(self.history_file)
+
+    def on_browse(self, event):
+        file_dialog = wx.FileDialog(self, self.dialog_title, wildcard=self.wildcard)
+        if file_dialog.ShowModal() == wx.ID_OK:
+            file_path = file_dialog.GetPath()
+            if file_path not in self.history:
+                self.history.insert(0, file_path)
+                self.combo_box.Insert(file_path, 0)
+                if len(self.history) > 16:
+                    self.history.pop()
+                if self.combo_box.Count > 16:
+                    self.combo_box.Delete(self.combo_box.Count - 1)
+            self.combo_box.SetValue(file_path)
+            wx.PostEvent(self.combo_box, wx.CommandEvent(wx.EVT_COMBOBOX.typeId, self.combo_box.GetId()))
+
+    def SetPath(self, path):
+        if path and path != '' and path not in self.history:
+            self.history.insert(0, path)
+            self.combo_box.Insert(path, 0)
+            if len(self.history) > 16:
+                self.history.pop()
+            if self.combo_box.Count > 16:
+                self.combo_box.Delete(self.combo_box.Count - 1)
+            with open(self.history_file, 'w') as f:
+                json.dump(self.history, f)
+        self.combo_box.SetValue(path)
+
+    def on_combo_box_change(self, event):
+        path = event.GetString()
+        if path == '':
+            path = self.combo_box.GetValue()
+        if not os.path.exists(path):
+            self.history.remove(path)
+            self.combo_box.Delete(self.combo_box.FindString(path))
+        if path in self.history:
+            self.history.remove(path)
+            self.history.insert(0, path)
+            self.combo_box.Delete(self.combo_box.FindString(path))
+            self.combo_box.Insert(path, 0)
+            self.combo_box.SetValue(path)
+            with open(self.history_file, 'w') as f:
+                json.dump(self.history, f)
+
+    def Bind(self, event, handler):
+        if event == wx.EVT_FILEPICKER_CHANGED:
+            self.handler = handler
+            self.combo_box.Bind(wx.EVT_COMBOBOX, self._on_combo_box_change)
+
+    def _on_combo_box_change(self, event):
+        self.handler(event)
+        self.on_combo_box_change(event)
+
+    def GetPath(self):
+        return self.combo_box.GetStringSelection()
+
+    def SetToolTip(self, tooltip_text):
+        self.combo_box.SetToolTip(tooltip_text)
 
 # ============================================================================
 #                               Class DropDownButton
@@ -92,8 +192,6 @@ class DropDownButton(wx.BitmapButton):
         super().__init__(parent, id, bitmap, pos, size, style)
         self.Bind(wx.EVT_BUTTON, self.OnButtonClick)
         self.popup_menu = wx.Menu()
-        #self.SetBackgroundColour(wx.Colour(48, 52, 52))
-        #self.SetForegroundColour(wx.Colour(255, 255, 255))
 
     def OnButtonClick(self, event):
         self.PopupMenu(self.popup_menu)
@@ -109,6 +207,224 @@ class DropDownButton(wx.BitmapButton):
         print(f"Selected link: {url}")
         open_device_image_download_link(url)
 
+# ============================================================================
+#                               Class GoogleImagesBaseMenu
+# ============================================================================
+class GoogleImagesBaseMenu(wx.Menu):
+    BASE_MENU_ID_START = 5000
+
+    def __init__(self, parent):
+        super(GoogleImagesBaseMenu, self).__init__()
+
+        self.parent = parent
+        self.load_data()
+        self.current_menu_id = self.BASE_MENU_ID_START
+
+    def generate_unique_id(self):
+        unique_id = self.current_menu_id
+        self.current_menu_id += 1
+        return unique_id
+
+    def reset_menu_id(self):
+        self.current_menu_id = self.BASE_MENU_ID_START
+
+    def bind_download_event(self, menu, url):
+        if menu is None:
+            print(f"Error: menu is None when adding menu item for {url}")
+            return
+        unique_id = self.generate_unique_id()
+        # next line is for debugging
+        # menu.SetItemLabel(f"{menu.GetItemLabel()} ({unique_id})")
+        def on_download_handler(event):
+            self.on_download(url, event, unique_id)
+
+        menu_id = menu.GetId()
+        self.parent.Bind(wx.EVT_MENU, on_download_handler, id=menu_id)
+
+    def load_data(self):
+        json_file_path = os.path.join(get_config_path(), "google_images.json").strip()
+        if not os.path.exists(json_file_path) or self.is_data_update_required():
+            get_google_images()
+            self.parent.config.google_images_last_checked = int(datetime.now().timestamp())
+        try:
+            with open(json_file_path, 'r', encoding='utf-8') as json_file:
+                self.data = json.load(json_file)
+        except FileNotFoundError:
+            print("google_images.json file not found.")
+            self.data = {}
+
+    def is_data_update_required(self):
+        last_checked = self.parent.config.google_images_last_checked
+        update_frequency = self.parent.config.google_images_update_frequency
+        # don't check for updates if it is set to -1
+        if update_frequency == -1:
+            return False
+        if last_checked is None:
+            return True
+        current_time = int(datetime.now().timestamp())
+        update_threshold = current_time - (update_frequency * 24 * 60 * 60)
+        return last_checked < update_threshold
+
+    def on_download(self, url, event=None, unique_id=any):
+        # debug(f"Download triggered for URL: {url}, Menu ID: {unique_id}")
+        def download_completed(destination_path):
+            self.parent.toast("Download Successful", f"File downloaded successfully: {url} and saved to {destination_path}")
+            print(f"{datetime.now():%Y-%m-%d %H:%M:%S} Download Successful", f"File downloaded successfully: {url} and saved to {destination_path}")
+            # self.parent.firmware_picker.SetPath(destination_path)
+            # self.parent.update_firmware_selection(destination_path)
+
+        filename = os.path.basename(url)
+        dialog = wx.FileDialog(None, "Save File", defaultFile=filename, wildcard="All files (*.*)|*.*", style=wx.FD_SAVE | wx.FD_OVERWRITE_PROMPT)
+        if dialog.ShowModal() == wx.ID_OK:
+            destination_path = dialog.GetPath()
+            print(f"{datetime.now():%Y-%m-%d %H:%M:%S} Starting background download for: {url} to be saved to {destination_path}\nplease be patient ...")
+            download_thread = threading.Thread(target=download_file, args=(url, destination_path), kwargs={"callback": lambda: download_completed(destination_path)})
+            download_thread.start()
+
+# ============================================================================
+#                               Class GoogleImagesMenu
+# ============================================================================
+class GoogleImagesMenu(GoogleImagesBaseMenu):
+    def __init__(self, parent):
+        super(GoogleImagesMenu, self).__init__(parent)
+
+        try:
+            self.phones_menu = wx.Menu()
+            self.watches_menu = wx.Menu()
+            device = get_phone()
+            device_hardware = None
+            device_firmware_date = None
+            download_available = False
+            phone_icon = images.phone_green_24.GetBitmap()
+            watch_icon = images.watch_green_24.GetBitmap()
+            device_icon = images.star_green_24.GetBitmap()
+            if hasattr(self.parent, 'firmware_button') and self.parent.firmware_button:
+                self.parent.firmware_button.SetBitmap(images.open_link_24.GetBitmap())
+
+            if device:
+                device_hardware = device.hardware
+                device_firmware_date = device.firmware_date
+
+            for device_id, device_data in self.data.items():
+                device_label = device_data['label']
+                device_type = device_data['type']
+                device_menu = wx.Menu()
+                device_download_flag = False
+
+                for download_type in ['ota', 'factory']:
+                    download_menu = wx.Menu()
+
+                    for download_entry in reversed(device_data[download_type]):
+                        version = download_entry['version']
+                        sha256 = download_entry['sha256']
+                        menu_label = f"{version} ({device_label})"
+                        menu_id = self.generate_unique_id()
+                        download_menu_item = download_menu.Append(menu_id, menu_label, sha256)
+                        if download_menu_item is None:
+                            print(f"Failed to create menu item with id {menu_id}, label {menu_label}, and sha256 {sha256}")
+                        else:
+                            download_date = download_entry['date']
+                            # Set the background color and the icon for the current device. (background color is not working)
+                            if device_id == device_hardware and device_firmware_date and download_date and int(download_date) > int(device_firmware_date):
+                                download_menu_item.SetBackgroundColour((100, 155, 139, 255))
+                                download_menu_item.SetBitmap(images.download_24.GetBitmap())
+                                device_download_flag = True
+                                download_available = True
+                                device_icon = images.download_24.GetBitmap()
+                                if device_type == "phone":
+                                    phone_icon = images.download_24.GetBitmap()
+                                elif device_type == "watch":
+                                    watch_icon = images.download_24.GetBitmap()
+
+                            url = download_entry['url']
+                            self.bind_download_event(download_menu_item, url)
+
+                    download_type_menu_item = device_menu.AppendSubMenu(download_menu, download_type.capitalize())
+                    if download_type == "ota":
+                        download_type_menu_item.SetBitmap(images.cloud_24.GetBitmap())
+                    elif download_type == "factory":
+                        download_type_menu_item.SetBitmap(images.factory_24.GetBitmap())
+
+                    if device_download_flag:
+                        download_type_menu_item.SetBitmap(images.download_24.GetBitmap())
+
+                if device_type == 'phone':
+                    device_menu_item = self.phones_menu.AppendSubMenu(device_menu, f"{device_id} ({device_label})")
+                    # Set the background color and the icon for the current device. (background color is not working)
+                    if device_id == device_hardware:
+                        device_menu_item.SetBitmap(device_icon)
+                        device_menu_item.SetBackgroundColour((100, 155, 139, 255))
+                elif device_type == 'watch':
+                    device_menu_item = self.watches_menu.AppendSubMenu(device_menu, f"{device_id} ({device_label})")
+                    # Set the background color and the icon for the current device. (background color is not working)
+                    if device_id == device_hardware:
+                        device_menu_item.SetBitmap(device_icon)
+                        device_menu_item.SetBackgroundColour((100, 155, 139, 255))
+
+            phone_menu_item = self.AppendSubMenu(self.phones_menu, "Phones")
+            phone_menu_item.SetBitmap(phone_icon)
+            watches_menu_item = self.AppendSubMenu(self.watches_menu, "Watches")
+            watches_menu_item.SetBitmap(watch_icon)
+
+            if download_available:
+                self.parent.toast("Updates are available", f"There are updates available for your device.\nCheck Google Images menu.")
+                if hasattr(self.parent, 'firmware_button') and self.parent.firmware_button:
+                    self.parent.firmware_button.SetBitmap(images.open_link_red_24.GetBitmap())
+
+        except Exception as e:
+            print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Encountered an error while building Google Images Menu.")
+            traceback.print_exc()
+
+# ============================================================================
+#                               Class GoogleImagesPopupMenu
+# ============================================================================
+class GoogleImagesPopupMenu(GoogleImagesBaseMenu):
+    def __init__(self, parent, device=None, date_filter=None):
+        super(GoogleImagesPopupMenu, self).__init__(parent)
+
+        try:
+            if device in self.data:
+                device_data = self.data[device]
+
+                submenu_ota = wx.Menu()
+                submenu_factory = wx.Menu()
+                download_flag = False
+
+                for download_entry in reversed(device_data['ota']):
+                    if download_entry['date'] is not None and (not date_filter or (date_filter is not None and int(download_entry['date']) >= int(date_filter))):
+                        version = download_entry['version']
+                        menu_label = f"{version} (OTA)"
+                        menu_id = wx.NewId()
+                        menu_item = submenu_ota.Append(menu_id, menu_label)
+                        self.parent.Bind(wx.EVT_MENU, lambda event, u=download_entry['url']: self.on_download(u), menu_item)
+                        if int(download_entry['date']) != int(date_filter):
+                            menu_item.SetBitmap(images.download_24.GetBitmap())
+                            download_flag = True
+
+                for download_entry in reversed(device_data['factory']):
+                    if download_entry['date'] is not None and (not date_filter or (date_filter is not None and int(download_entry['date']) >= int(date_filter))):
+                        version = download_entry['version']
+                        menu_label = f"{version} (Factory)"
+                        menu_id = wx.NewId()
+                        menu_item = submenu_factory.Append(menu_id, menu_label)
+                        self.parent.Bind(wx.EVT_MENU, lambda event, u=download_entry['url']: self.on_download(u), menu_item)
+                        if int(download_entry['date']) != int(date_filter):
+                            menu_item.SetBitmap(images.download_24.GetBitmap())
+                            download_flag = True
+
+            with contextlib.suppress(Exception):
+                ota_menu_item = self.AppendSubMenu(submenu_ota, "OTA")
+                factory_menu_item = self.AppendSubMenu(submenu_factory, "Factory")
+                if download_flag:
+                    ota_menu_item.SetBitmap(images.download_24.GetBitmap())
+                    factory_menu_item.SetBitmap(images.download_24.GetBitmap())
+                else:
+                    ota_menu_item.SetBitmap(images.cloud_24.GetBitmap())
+                    factory_menu_item.SetBitmap(images.factory_24.GetBitmap())
+
+        except Exception as e:
+            print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Encountered an error while building Google Images Popup Menu.")
+            traceback.print_exc()
 
 # ============================================================================
 #                               Class PixelFlasher
@@ -123,8 +439,7 @@ class PixelFlasher(wx.Frame):
         init_db()
         wx.Frame.__init__(self, parent, -1, title, size=(self.config.width, self.config.height),
                           style=wx.DEFAULT_FRAME_STYLE | wx.NO_FULL_REPAINT_ON_RESIZE | wx.SYSTEM_MENU | wx.CLOSE_BOX)
-        self.SetBackgroundColour(wx.Colour(48, 52, 52))
-        self.SetForegroundColour(wx.Colour(255, 255, 255))
+
         # Base first run size on resolution.
         if self.config.first_run:
             x = int((self.CharWidth * self.config.width) / 11)
@@ -139,8 +454,9 @@ class PixelFlasher(wx.Frame):
         self._build_menu_bar()
         self._init_ui()
 
-        sys.stdout = RedirectText(self.console_ctrl)
-        sys.stderr = RedirectText(self.console_ctrl)
+        redirect_text = RedirectText(self.console_ctrl)
+        sys.stdout = redirect_text
+        sys.stderr = redirect_text
 
         # self.Centre(wx.BOTH)
         if self.config.pos_x and self.config.pos_y:
@@ -149,12 +465,16 @@ class PixelFlasher(wx.Frame):
         self.resizing = False
         if not dont_initialize:
             self.initialize()
+        set_window_shown(True)
         self.Show(True)
 
     # -----------------------------------------------
     #                  initialize
     # -----------------------------------------------
     def initialize(self):
+        if do_profiling:
+            profiler = cProfile.Profile()
+            profiler.enable()
         t = f":{datetime.now():%Y-%m-%d %H:%M:%S}"
         print(f"PixelFlasher {VERSION} started on {t}")
         puml(f"{t};\n")
@@ -334,6 +654,7 @@ class PixelFlasher(wx.Frame):
 
             debug("Populate device list")
             connected_devices = get_connected_devices()
+            print(f"Discovered {len(connected_devices)} device(s) connected.")
             self.device_choice.AppendItems(connected_devices)
             d_list_string = '\n'.join(connected_devices)
             puml(f"note right\n{d_list_string}\nend note\n")
@@ -364,6 +685,11 @@ class PixelFlasher(wx.Frame):
         self.spinner.Hide()
         self.spinner_label.Hide()
         self.init_complete = True
+
+        if do_profiling:
+            profiler.disable()
+            stats = pstats.Stats(profiler).sort_stats('tottime')  # 'tottime' for total time
+            stats.print_stats()
 
     # -----------------------------------------------
     #           enable_disable_radio_buttons
@@ -421,7 +747,7 @@ class PixelFlasher(wx.Frame):
     #                  _set_icons
     # -----------------------------------------------
     def _set_icons(self):
-        self.SetIcon(images.Icon_256.GetIcon())
+        self.SetIcon(images.Icon_dark_256.GetIcon())
 
     # -----------------------------------------------
     #                  _build_status_bar
@@ -431,8 +757,6 @@ class PixelFlasher(wx.Frame):
         self.statusBar.SetStatusWidths([-2, -1])
         status_text = f"Welcome to PixelFlasher {VERSION}"
         self.statusBar.SetStatusText(status_text, 0)
-        self.statusBar.SetBackgroundColour(wx.Colour(48, 52, 52))
-        self.statusBar.SetForegroundColour(wx.Colour(255, 255, 255))
 
     # -----------------------------------------------
     #                  _build_toolbar
@@ -445,9 +769,7 @@ class PixelFlasher(wx.Frame):
             tb = self.CreateToolBar(flags)
             # tb = MultiLineToolbar(self, flags)  # Use the custom MultiLineToolbar class
             self.tb = tb
-            self.tb.SetBackgroundColour(wx.Colour(48, 52, 52))
-            self.tb.SetForegroundColour(wx.Colour(255, 255, 255))
-            
+
             tsize = (64, 64)
             null_bmp = wx.BitmapBundle(wx.NullBitmap)
             tb.SetToolBitmapSize(tsize)
@@ -457,12 +779,6 @@ class PixelFlasher(wx.Frame):
                 tb.AddTool(toolId=5, label="Install APK", bitmap=images.install_apk_64.GetBitmap(), bmpDisabled=null_bmp, kind=wx.ITEM_NORMAL, shortHelp="Install APK on the device", longHelp="Install APK on the device", clientData=None)
                 self.Bind(wx.EVT_TOOL, self.OnToolClick, id=5)
                 self.Bind(wx.EVT_TOOL_RCLICKED, self.OnToolRClick, id=5)
-
-            # Install APK
-            if self.config.toolbar['visible']['edit_am_apk']:
-                tb.AddTool(toolId=5, label="Edit APK Manifest", bitmap=images.install_apk_64.GetBitmap(), bmpDisabled=null_bmp, kind=wx.ITEM_NORMAL, shortHelp="Edit the manifest of an APK", longHelp="Use apktool to edit the AndroidManifest.xml of an APK", clientData=None)
-                self.Bind(wx.EVT_TOOL, self.OnToolClick, id=6)
-                self.Bind(wx.EVT_TOOL_RCLICKED, self.OnToolRClick, id=6)
 
             # Package Manager
             if self.config.toolbar['visible']['package_manager']:
@@ -657,8 +973,6 @@ class PixelFlasher(wx.Frame):
         id = event.GetId()
         if id == 5:
             self._on_install_apk(event)
-        if id == 6:
-            self._on_edit_am_apk(event)
         elif id == 8:
             self._on_package_manager(event)
         elif id == 10:
@@ -806,7 +1120,7 @@ class PixelFlasher(wx.Frame):
         file_menu.AppendSeparator()
         # Exit Menu
         wx.App.SetMacExitMenuItemId(wx.ID_EXIT)
-        exit_item = file_menu.Append(wx.ID_EXIT, "E&xit\tCtrl-Q", "Exit PixelFlasher")
+        exit_item = file_menu.Append(wx.ID_ANY, "E&xit\tCtrl-Q", "Exit PixelFlasher")
         exit_item.SetBitmap(images.exit_24.GetBitmap())
         self.Bind(wx.EVT_MENU, self._on_exit_app, exit_item)
 
@@ -816,10 +1130,6 @@ class PixelFlasher(wx.Frame):
         self.install_apk = device_menu.Append(wx.ID_ANY, "Install APK", "Install APK")
         self.install_apk.SetBitmap(images.install_apk_24.GetBitmap())
         self.Bind(wx.EVT_MENU, self._on_install_apk, self.install_apk)
-        # Install APK
-        self.edit_am_apk = device_menu.Append(wx.ID_ANY, "Edit APK Manifest", "Edit APK Manifest")
-        self.install_apk.SetBitmap(images.install_apk_24.GetBitmap())
-        self.Bind(wx.EVT_MENU, self._on_edit_am_apk, self.edit_am_apk)
         # Bulk Install APK
         self.bulk_install_apk = device_menu.Append(wx.ID_ANY, "Bulk Install APK", "Bulk Install APK")
         self.bulk_install_apk.SetBitmap(images.install_apk_24.GetBitmap())
@@ -843,7 +1153,7 @@ class PixelFlasher(wx.Frame):
         self.device_info_menu_item.SetBitmap(images.about_24.GetBitmap())
         self.Bind(wx.EVT_MENU, self._on_device_info, self.device_info_menu_item)
         # Get PIF Print Menu
-        self.pif_info_menu_item = device_menu.Append(wx.ID_ANY, "Pif Print", "Get current device's Pif print")
+        self.pif_info_menu_item = device_menu.Append(wx.ID_ANY, "Pif Print", "Get current device's Pif print (osm0sis fork v5 format)")
         self.pif_info_menu_item.SetBitmap(images.json_24.GetBitmap())
         self.Bind(wx.EVT_MENU, self._on_pif_info, self.pif_info_menu_item)
         # Get Props as json Menu
@@ -854,6 +1164,10 @@ class PixelFlasher(wx.Frame):
         self.xml_view_menu_item = device_menu.Append(wx.ID_ANY, "Dump Screen XML", "Use uiautomator to dump the screen view in xml")
         self.xml_view_menu_item.SetBitmap(images.xml_24.GetBitmap())
         self.Bind(wx.EVT_MENU, self._on_xml_view, self.xml_view_menu_item)
+        # Cancel OTA Update Menu
+        self.cancel_ota_menu_item = device_menu.Append(wx.ID_ANY, "Cancel OTA Update", "Cancels and Resets OTA updates by Google (Not PixelFlasher)")
+        self.cancel_ota_menu_item.SetBitmap(images.cancel_ota_24.GetBitmap())
+        self.Bind(wx.EVT_MENU, self._on_cancel_ota, self.cancel_ota_menu_item)
         # # Verity / Verification Menu
         # self.verity_menu_item = device_menu.Append(wx.ID_ANY, "Verity / Verification Status", "Check Verity / Verification Status")
         # self.verity_menu_item.SetBitmap(images.shield_24.GetBitmap())
@@ -941,25 +1255,25 @@ class PixelFlasher(wx.Frame):
         # Toolbar Menu Items
         # ------------------
         # Top
-        tb_top_item = tb_menu.Append(1010, 'Top', 'Top', wx.ITEM_RADIO)
+        tb_top_item = tb_menu.Append(21010, 'Top', 'Top', wx.ITEM_RADIO)
         tb_top_item.SetBitmap(images.top_24.GetBitmap())
         if self.config.toolbar and self.config.toolbar['tb_position'] == 'top':
             tb_top_item.Check()
         self.Bind(wx.EVT_MENU, self._on_tb_update, tb_top_item)
         # Left
-        tb_left_item = tb_menu.Append(1020, 'Left', 'Left', wx.ITEM_RADIO)
+        tb_left_item = tb_menu.Append(21020, 'Left', 'Left', wx.ITEM_RADIO)
         tb_left_item.SetBitmap(images.left_24.GetBitmap())
         if self.config.toolbar and self.config.toolbar['tb_position'] == 'left':
             tb_left_item.Check()
         self.Bind(wx.EVT_MENU, self._on_tb_update, tb_left_item)
         # Right
-        tb_right_item = tb_menu.Append(1030, 'Right', 'Right', wx.ITEM_RADIO)
+        tb_right_item = tb_menu.Append(21030, 'Right', 'Right', wx.ITEM_RADIO)
         tb_right_item.SetBitmap(images.right_24.GetBitmap())
         if self.config.toolbar and self.config.toolbar['tb_position'] == 'right':
             tb_right_item.Check()
         self.Bind(wx.EVT_MENU, self._on_tb_update, tb_right_item)
         # Bottom
-        tb_bottom_item = tb_menu.Append(1040, 'Bottom', 'Bottom', wx.ITEM_RADIO)
+        tb_bottom_item = tb_menu.Append(21040, 'Bottom', 'Bottom', wx.ITEM_RADIO)
         tb_bottom_item.SetBitmap(images.bottom_24.GetBitmap())
         if self.config.toolbar and self.config.toolbar['tb_position'] == 'bottom':
             tb_bottom_item.Check()
@@ -967,11 +1281,11 @@ class PixelFlasher(wx.Frame):
         # separator
         tb_menu.AppendSeparator()
         # Checkboxes
-        self.tb_show_text_item = tb_menu.Append(1100, "Show Button Text", "Show Button Text", wx.ITEM_CHECK)
+        self.tb_show_text_item = tb_menu.Append(21100, "Show Button Text", "Show Button Text", wx.ITEM_CHECK)
         if self.config.toolbar and self.config.toolbar['tb_show_text']:
             self.tb_show_text_item.Check()
         self.Bind(wx.EVT_MENU, self._on_tb_update, self.tb_show_text_item)
-        self.tb_show_button_item = tb_menu.Append(1200, "Show Button Icon", "Show Button Icon", wx.ITEM_CHECK)
+        self.tb_show_button_item = tb_menu.Append(21200, "Show Button Icon", "Show Button Icon", wx.ITEM_CHECK)
         if self.config.toolbar and self.config.toolbar['tb_show_icons']:
             self.tb_show_button_item.Check()
         self.Bind(wx.EVT_MENU, self._on_tb_update, self.tb_show_button_item)
@@ -1032,46 +1346,71 @@ class PixelFlasher(wx.Frame):
         # Help Menu Items
         # ---------------
         # Report an issue
-        issue_item = help_menu.Append(wx.ID_ANY, 'Report an Issue', 'Report an Issue')
-        issue_item.SetBitmap(images.bug_24.GetBitmap())
-        self.Bind(wx.EVT_MENU, self._on_report_an_issue, issue_item)
+        self.issue_item = help_menu.Append(wx.ID_ANY, 'Report an Issue', 'Report an Issue')
+        self.issue_item.SetBitmap(images.bug_24.GetBitmap())
+        self.Bind(wx.EVT_MENU, self._on_link_clicked, self.issue_item)
         # # Feature Request
-        feature_item = help_menu.Append(wx.ID_ANY, 'Feature Request', 'Feature Request')
-        feature_item.SetBitmap(images.feature_24.GetBitmap())
-        self.Bind(wx.EVT_MENU, self._on_feature_request, feature_item)
+        self.feature_item = help_menu.Append(wx.ID_ANY, 'Feature Request', 'Feature Request')
+        self.feature_item.SetBitmap(images.feature_24.GetBitmap())
+        self.Bind(wx.EVT_MENU, self._on_link_clicked, self.feature_item)
         # # Project Home
-        project_page_item = help_menu.Append(wx.ID_ANY, 'PixelFlasher Project Page', 'PixelFlasher Project Page')
-        project_page_item.SetBitmap(images.github_24.GetBitmap())
-        self.Bind(wx.EVT_MENU, self._on_project_page, project_page_item)
+        self.project_page_item = help_menu.Append(wx.ID_ANY, 'PixelFlasher Project Page', 'PixelFlasher Project Page')
+        self.project_page_item.SetBitmap(images.github_24.GetBitmap())
+        self.Bind(wx.EVT_MENU, self._on_link_clicked, self.project_page_item)
         # Community Forum
-        forum_item = help_menu.Append(wx.ID_ANY, 'PixelFlasher Community (Forum)', 'PixelFlasher Community (Forum)')
-        forum_item.SetBitmap(images.forum_24.GetBitmap())
-        self.Bind(wx.EVT_MENU, self._on_forum, forum_item)
+        self.forum_item = help_menu.Append(wx.ID_ANY, 'PixelFlasher Community (Forum)', 'PixelFlasher Community (Forum)')
+        self.forum_item.SetBitmap(images.forum_24.GetBitmap())
+        self.Bind(wx.EVT_MENU, self._on_link_clicked, self.forum_item)
         # seperator
         help_menu.AppendSeparator()
         # Links Submenu
         links = wx.Menu()
-        linksMenuItem1 = links.Append(wx.ID_ANY, "Homeboy76\'s Guide")
-        linksMenuItem2 = links.Append(wx.ID_ANY, "V0latyle\'s Guide")
-        linksMenuItem3 = links.Append(wx.ID_ANY, "roirraW\'s Guide")
-        linksMenuItem4 = links.Append(wx.ID_ANY, "kdrag0n\'s safetynet-fix")
-        linksMenuItem5 = links.Append(wx.ID_ANY, "Displax\'s safetynet-fix")
-        linksMenuItem6 = links.Append(wx.ID_ANY, "Get the Google USB Driver")
-        linksMenuItem7 = links.Append(wx.ID_ANY, "Android Security Update Bulletins")
-        linksMenuItem1.SetBitmap(images.guide_24.GetBitmap())
-        linksMenuItem2.SetBitmap(images.guide_24.GetBitmap())
-        linksMenuItem3.SetBitmap(images.guide_24.GetBitmap())
-        linksMenuItem4.SetBitmap(images.open_link_24.GetBitmap())
-        linksMenuItem5.SetBitmap(images.open_link_24.GetBitmap())
-        linksMenuItem6.SetBitmap(images.open_link_24.GetBitmap())
-        linksMenuItem7.SetBitmap(images.open_link_24.GetBitmap())
-        self.Bind(wx.EVT_MENU, self._on_guide1, linksMenuItem1)
-        self.Bind(wx.EVT_MENU, self._on_guide2, linksMenuItem2)
-        self.Bind(wx.EVT_MENU, self._on_guide3, linksMenuItem3)
-        self.Bind(wx.EVT_MENU, self._on_link1, linksMenuItem4)
-        self.Bind(wx.EVT_MENU, self._on_link2, linksMenuItem5)
-        self.Bind(wx.EVT_MENU, self._on_link3, linksMenuItem6)
-        self.Bind(wx.EVT_MENU, self._on_link4, linksMenuItem7)
+        self.linksMenuItem1 = links.Append(wx.ID_ANY, "Homeboy76\'s Guide")
+        self.linksMenuItem2 = links.Append(wx.ID_ANY, "V0latyle\'s Guide")
+        self.linksMenuItem3 = links.Append(wx.ID_ANY, "roirraW\'s Guide")
+        links.AppendSeparator()
+        self.linksMenuItem4 = links.Append(wx.ID_ANY, "osm0sis\'s PlayIntegrityFork")
+        self.linksMenuItem5 = links.Append(wx.ID_ANY, "chiteroman\'s PlayIntegrityFix")
+        self.linksMenuItem8 = links.Append(wx.ID_ANY, "TheFreeman193\'s Play Integrity Fix Props Collection")
+        links.AppendSeparator()
+        self.linksMenuItem6 = links.Append(wx.ID_ANY, "Get the Google USB Driver")
+        self.linksMenuItem7 = links.Append(wx.ID_ANY, "Android Security Update Bulletins")
+        links.AppendSeparator()
+        self.linksMenuItem9 = links.Append(wx.ID_ANY, "Full OTA Images for Pixel Phones / Tablets")
+        self.linksMenuItem10 = links.Append(wx.ID_ANY, "Factory Images for Pixel Phones / Tablets")
+        self.linksMenuItem11 = links.Append(wx.ID_ANY, "Full OTA Images for Pixel Watches")
+        self.linksMenuItem12 = links.Append(wx.ID_ANY, "Factory Images for Pixel Watches")
+        links.AppendSeparator()
+        self.linksMenuItem13 = links.Append(wx.ID_ANY, "Full OTA Images for Pixel Beta 14")
+        self.linksMenuItem14 = links.Append(wx.ID_ANY, "Factory Images for Pixel Beta 14")
+        self.linksMenuItem1.SetBitmap(images.guide_24.GetBitmap())
+        self.linksMenuItem2.SetBitmap(images.guide_24.GetBitmap())
+        self.linksMenuItem3.SetBitmap(images.guide_24.GetBitmap())
+        self.linksMenuItem4.SetBitmap(images.open_link_24.GetBitmap())
+        self.linksMenuItem5.SetBitmap(images.open_link_24.GetBitmap())
+        self.linksMenuItem6.SetBitmap(images.open_link_24.GetBitmap())
+        self.linksMenuItem7.SetBitmap(images.open_link_24.GetBitmap())
+        self.linksMenuItem8.SetBitmap(images.open_link_24.GetBitmap())
+        self.linksMenuItem9.SetBitmap(images.open_link_24.GetBitmap())
+        self.linksMenuItem10.SetBitmap(images.open_link_24.GetBitmap())
+        self.linksMenuItem11.SetBitmap(images.open_link_24.GetBitmap())
+        self.linksMenuItem12.SetBitmap(images.open_link_24.GetBitmap())
+        self.linksMenuItem13.SetBitmap(images.open_link_24.GetBitmap())
+        self.linksMenuItem14.SetBitmap(images.open_link_24.GetBitmap())
+        self.Bind(wx.EVT_MENU, self._on_link_clicked, self.linksMenuItem1)
+        self.Bind(wx.EVT_MENU, self._on_link_clicked, self.linksMenuItem2)
+        self.Bind(wx.EVT_MENU, self._on_link_clicked, self.linksMenuItem3)
+        self.Bind(wx.EVT_MENU, self._on_link_clicked, self.linksMenuItem4)
+        self.Bind(wx.EVT_MENU, self._on_link_clicked, self.linksMenuItem5)
+        self.Bind(wx.EVT_MENU, self._on_link_clicked, self.linksMenuItem6)
+        self.Bind(wx.EVT_MENU, self._on_link_clicked, self.linksMenuItem7)
+        self.Bind(wx.EVT_MENU, self._on_link_clicked, self.linksMenuItem8)
+        self.Bind(wx.EVT_MENU, self._on_link_clicked, self.linksMenuItem9)
+        self.Bind(wx.EVT_MENU, self._on_link_clicked, self.linksMenuItem10)
+        self.Bind(wx.EVT_MENU, self._on_link_clicked, self.linksMenuItem11)
+        self.Bind(wx.EVT_MENU, self._on_link_clicked, self.linksMenuItem12)
+        self.Bind(wx.EVT_MENU, self._on_link_clicked, self.linksMenuItem13)
+        self.Bind(wx.EVT_MENU, self._on_link_clicked, self.linksMenuItem14)
         links_item = help_menu.Append(wx.ID_ANY, 'Links', links)
         links_item.SetBitmap(images.open_link_24.GetBitmap())
         # seperator
@@ -1098,7 +1437,7 @@ class PixelFlasher(wx.Frame):
         # seperator
         help_menu.AppendSeparator()
         # About
-        about_item = help_menu.Append(wx.ID_ABOUT, '&About PixelFlasher', 'About')
+        about_item = help_menu.Append(wx.ID_ANY, '&About PixelFlasher', 'About')
         about_item.SetBitmap(images.about_24.GetBitmap())
         self.Bind(wx.EVT_MENU, self._on_help_about, about_item)
 
@@ -1106,6 +1445,10 @@ class PixelFlasher(wx.Frame):
         self.menuBar.Append(file_menu, "&File")
         # Add the Device menu to the menu bar
         self.menuBar.Append(device_menu, "&Device")
+        # Create an instance of GoogleImagesMenu
+        self.google_images_menu = GoogleImagesMenu(self)
+        # Append GoogleImagesMenu to the menu bar
+        self.menuBar.Append(self.google_images_menu, "Google Images")
         # Add the Toolbar menu to the menu bar
         self.menuBar.Append(tb_menu, "&Toolbar")
         # Add the Help menu to the menu bar
@@ -1220,22 +1563,23 @@ class PixelFlasher(wx.Frame):
     # -----------------------------------------------
     def _on_tb_update(self, event):
         clicked_item_id = event.GetId()
+        # print(f"Clicked item ID: {clicked_item_id}")
 
-        if clicked_item_id == 1010:
+        if clicked_item_id == 21010:
             self.config.toolbar['tb_position'] = 'top'
-        elif clicked_item_id == 1020:
+        elif clicked_item_id == 21020:
             self.config.toolbar['tb_position'] = 'left'
-        elif clicked_item_id == 1030:
+        elif clicked_item_id == 21030:
             self.config.toolbar['tb_position'] = 'right'
-        elif clicked_item_id == 1040:
+        elif clicked_item_id == 21040:
             self.config.toolbar['tb_position'] = 'bottom'
-        elif clicked_item_id == 1100:
+        elif clicked_item_id == 21100:
             # Button Text
             self.config.toolbar['tb_show_text'] = event.IsChecked()
             if not event.IsChecked():
                 self.config.toolbar['tb_show_icons'] = True
                 self.tb_show_button_item.Check(True)
-        elif clicked_item_id == 1200:
+        elif clicked_item_id == 21200:
             # Button icon
             self.config.toolbar['tb_show_icons'] = event.IsChecked()
             if not event.IsChecked():
@@ -1318,7 +1662,7 @@ class PixelFlasher(wx.Frame):
             pathname = fileDialog.GetPath()
             print(f"\nSelected {pathname} for installation.")
             try:
-                dlg = wx.MessageDialog(None, "Do you want to set the ownership to Play Store?\nNote: Android auto apps require that they be installed from the Play Store.",'APK Installation',wx.YES_NO | wx.NO_DEFAULT | wx.CANCEL | wx.ICON_EXCLAMATION)
+                dlg = wx.MessageDialog(None, "Do you want to set the ownership to Play Store Market?\nNote: Android auto apps require that they be installed from the Play Market.",'APK Installation',wx.YES_NO | wx.NO_DEFAULT | wx.CANCEL | wx.ICON_EXCLAMATION)
             except Exception:
                 traceback.print_exc()
                 return
@@ -1327,9 +1671,9 @@ class PixelFlasher(wx.Frame):
                 self._on_spin('start')
                 if result == wx.ID_YES:
                     puml("note right:Set ownership to Play Store;\n")
-                    device.install_apk(pathname, fastboot_included=True, owner_playstore=True, ignore_low_target_sdk=True)
+                    device.install_apk(pathname, fastboot_included=True, owner_playstore=True)
                 elif result == wx.ID_NO:
-                    device.install_apk(pathname, fastboot_included=True, ignore_low_target_sdk=True)
+                    device.install_apk(pathname, fastboot_included=True)
                 else:
                     puml("note right:Cancelled APK installation;\n")
                     print("User cancelled apk installation.")
@@ -1337,53 +1681,6 @@ class PixelFlasher(wx.Frame):
                 traceback.print_exc()
                 wx.LogError(f"Cannot install file '{pathname}'.")
             self._on_spin('stop')
-
-    # -----------------------------------------------
-    #                  _on_install_apk
-    # -----------------------------------------------
-    def _on_edit_am_apk(self, event):
-        device = get_phone()
-        if not device:
-            print("ERROR: Please select a device before attempting APK Installation")
-            self.toast("APK Install", "ERROR: Please select a device before attempting APK Installation.")
-            return
-
-        with wx.FileDialog(self, "Select APK file to install (apktool.jar must be in the same directory)", '', '', wildcard="Android Applications (*.*.apk)|*.apk", style=wx.FD_OPEN) as fileDialog:
-            if fileDialog.ShowModal() == wx.ID_CANCEL:
-                return     # the user changed their mind
-            # save the current contents in the file
-            pathname = fileDialog.GetPath()
-            print(f"\nSelected {pathname} for editing.")
-            apktool_path = os.path.join(os.path.dirname(pathname), "apktool.jar")
-            output_directory = pathname + "_decompiled"
-            try:
-                cmd = f"java -jar {apktool_path} d -f {pathname} -o {output_directory}"
-                subprocess.run(cmd, shell=True)
-                manifest_path = os.path.join(output_directory, "AndroidManifest.xml")
-                if os.path.exists(manifest_path):
-                    subprocess.run(["xdg-open", manifest_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    print("Opened manifest file")
-                else:
-                    print("Did not open manifest file")
-                #dlg = wx.MessageDialog(None, "Do you want to set the ownership to Play Store?\nNote: Android auto apps require that they be installed from the Play Store.",'APK Installation',wx.YES_NO | wx.NO_DEFAULT | wx.CANCEL | wx.ICON_EXCLAMATION)
-            except Exception:
-                traceback.print_exc()
-                return
-            # result = dlg.ShowModal()
-            # try:
-            #     self._on_spin('start')
-            #     if result == wx.ID_YES:
-            #         puml("note right:Set ownership to Play Store;\n")
-            #         device.install_apk(pathname, fastboot_included=True, owner_playstore=True, ignore_low_target_sdk=True)
-            #     elif result == wx.ID_NO:
-            #         device.install_apk(pathname, fastboot_included=True, ignore_low_target_sdk=True)
-            #     else:
-            #         puml("note right:Cancelled APK installation;\n")
-            #         print("User cancelled apk installation.")
-            # except IOError:
-            #     traceback.print_exc()
-            #     wx.LogError(f"Cannot install file '{pathname}'.")
-            # self._on_spin('stop')
 
     # -----------------------------------------------
     #                  _on_bulk_install_apk
@@ -1455,147 +1752,47 @@ class PixelFlasher(wx.Frame):
         event.Skip(True)
 
     # -----------------------------------------------
-    #                  _on_report_an_issue
+    #                  _on_link_clicked
     # -----------------------------------------------
-    # Menu methods
-    def _on_report_an_issue(self, event):
+    def _on_link_clicked(self, event):
         try:
             self._on_spin('start')
-            webbrowser.open_new('https://github.com/badabing2005/PixelFlasher/issues/new')
-            puml(f":Open Link;\nnote right\n=== Report an Issue\n[[https://github.com/badabing2005/PixelFlasher/issues/new]]\nend note\n", True)
-        except Exception as e:
-            print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Encountered an error while opening a link")
-            traceback.print_exc()
-        self._on_spin('stop')
+            clicked_id = event.GetId()
 
-    # -----------------------------------------------
-    #                  _on_feature_request
-    # -----------------------------------------------
-    def _on_feature_request(self, event):
-        try:
-            self._on_spin('start')
-            webbrowser.open_new('https://github.com/badabing2005/PixelFlasher/issues/new')
-            puml(f":Open Link;\nnote right\n=== Feature Request\n[[https://github.com/badabing2005/PixelFlasher/issues/new]]\nend note\n", True)
-        except Exception as e:
-            print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Encountered an error while opening a link")
-            traceback.print_exc()
-        self._on_spin('stop')
+            # A dictionary mapping menu item IDs to tuples containing URL and link description
+            link_info = {
+                self.issue_item.GetId(): ('https://github.com/badabing2005/PixelFlasher/issues/new', "Report an Issue"),
+                self.feature_item.GetId(): ('https://github.com/badabing2005/PixelFlasher/issues/new', "Feature Request"),
+                self.project_page_item.GetId(): ('https://github.com/badabing2005/PixelFlasher', "PixelFlasher Project Page"),
+                self.forum_item.GetId(): ('https://forum.xda-developers.com/t/pixelflasher-gui-tool-that-facilitates-flashing-updating-pixel-phones.4415453/', "PixelFlasher Community (Forum)"),
+                self.linksMenuItem1.GetId(): ('https://xdaforums.com/t/guide-november-6-2023-root-pixel-8-pro-unlock-bootloader-pass-safetynet-both-slots-bootable-more.4638510/#post-89128833/', "Homeboy76's Guide"),
+                self.linksMenuItem2.GetId(): ('https://forum.xda-developers.com/t/guide-root-pixel-6-oriole-with-magisk.4356233/', "V0latyle's Guide"),
+                self.linksMenuItem3.GetId(): ('https://forum.xda-developers.com/t/december-5-2022-tq1a-221205-011-global-012-o2-uk-unlock-bootloader-root-pixel-7-pro-cheetah-safetynet.4502805/', "roirraW's Guide"),
+                self.linksMenuItem4.GetId(): ('https://github.com/osm0sis/PlayIntegrityFork', "osm0sis's PlayIntegrityFork"),
+                self.linksMenuItem5.GetId(): ('https://github.com/chiteroman/PlayIntegrityFix', "chiteroman's PlayIntegrityFix"),
+                self.linksMenuItem6.GetId(): ('https://developer.android.com/studio/run/win-usb?authuser=1%2F', "Get the Google USB Driver"),
+                self.linksMenuItem7.GetId(): ('https://source.android.com/docs/security/bulletin/', "Android Security Update Bulletins"),
+                self.linksMenuItem8.GetId(): ('https://github.com/TheFreeman193/PIFS', "TheFreeman193's Play Integrity Fix Props Collection"),
+                self.linksMenuItem9.GetId(): (FULL_OTA_IMAGES_FOR_PIXEL_DEVICES, "Full OTA Images for Pixel Phones, Tablets"),
+                self.linksMenuItem10.GetId(): (FACTORY_IMAGES_FOR_PIXEL_DEVICES, "Factory Images for Pixel Phones, Tablets"),
+                self.linksMenuItem11.GetId(): (FULL_OTA_IMAGES_FOR_WATCH_DEVICES, "Full OTA Images for Pixel Watches"),
+                self.linksMenuItem12.GetId(): (FACTORY_IMAGES_FOR_WATCH_DEVICES, "Factory Images for Pixel Watches"),
+                self.linksMenuItem13.GetId(): (FULL_OTA_IMAGES_FOR_BETA, "Full OTA Images for Pixel Beta 14"),
+                self.linksMenuItem14.GetId(): (FACTORY_IMAGES_FOR_BETA, "Factory Images for Pixel Beta 14"),
+            }
 
-    # -----------------------------------------------
-    #                  _on_project_page
-    # -----------------------------------------------
-    def _on_project_page(self, event):
-        try:
-            self._on_spin('start')
-            webbrowser.open_new('https://github.com/badabing2005/PixelFlasher')
-            puml(f":Open Link;\nnote right\n=== Github Project Page\n[[https://github.com/badabing2005/PixelFlasher]]\nend note\n", True)
-        except Exception as e:
-            print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Encountered an error while opening a link")
-            traceback.print_exc()
-        self._on_spin('stop')
+            if clicked_id in link_info:
+                url, description = link_info[clicked_id]
+                webbrowser.open_new(url)
+                print(f"Open Link {description} {url}")
+                puml(f":Open Link;\nnote right\n=== {description}\n[[{url}]]\nend note\n", True)
+            else:
+                print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Unknown menu item clicked")
 
-    # -----------------------------------------------
-    #                  _on_forum
-    # -----------------------------------------------
-    def _on_forum(self, event):
-        try:
-            self._on_spin('start')
-            webbrowser.open_new('https://forum.xda-developers.com/t/pixelflasher-gui-tool-that-facilitates-flashing-updating-pixel-phones.4415453/')
-            puml(f":Open Link;\nnote right\n=== PixelFlasher @XDA\n[[https://forum.xda-developers.com/t/pixelflasher-gui-tool-that-facilitates-flashing-updating-pixel-phones.4415453/]]\nend note\n", True)
         except Exception as e:
             print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Encountered an error while opening a link")
             traceback.print_exc()
-        self._on_spin('stop')
 
-    # -----------------------------------------------
-    #                  _on_guide1
-    # -----------------------------------------------
-    def _on_guide1(self, event):
-        try:
-            self._on_spin('start')
-            webbrowser.open_new('https://xdaforums.com/t/guide-november-6-2023-root-pixel-8-pro-unlock-bootloader-pass-safetynet-both-slots-bootable-more.4638510/#post-89128833/')
-            puml(f":Open Link;\nnote right\n=== Homeboy76's Guide\n[[https://xdaforums.com/t/guide-november-6-2023-root-pixel-8-pro-unlock-bootloader-pass-safetynet-both-slots-bootable-more.4638510/#post-89128833/]]\nend note\n", True)
-        except Exception as e:
-            print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Encountered an error while opening a link")
-            traceback.print_exc()
-        self._on_spin('stop')
-
-    # -----------------------------------------------
-    #                  _on_guide2
-    # -----------------------------------------------
-    def _on_guide2(self, event):
-        try:
-            self._on_spin('start')
-            webbrowser.open_new('https://forum.xda-developers.com/t/guide-root-pixel-6-oriole-with-magisk.4356233/')
-            puml(f":Open Link;\nnote right\n=== V0latyle's Guide\n[[https://forum.xda-developers.com/t/guide-root-pixel-6-oriole-with-magisk.4356233/]]\nend note\n", True)
-        except Exception as e:
-            print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Encountered an error while opening a link")
-            traceback.print_exc()
-        self._on_spin('stop')
-
-    # -----------------------------------------------
-    #                  _on_guide3
-    # -----------------------------------------------
-    def _on_guide3(self, event):
-        try:
-            self._on_spin('start')
-            webbrowser.open_new('https://forum.xda-developers.com/t/december-5-2022-tq1a-221205-011-global-012-o2-uk-unlock-bootloader-root-pixel-7-pro-cheetah-safetynet.4502805/')
-            puml(f":Open Link;\nnote right\n=== roirraW's Guide\n[[https://forum.xda-developers.com/t/december-5-2022-tq1a-221205-011-global-012-o2-uk-unlock-bootloader-root-pixel-7-pro-cheetah-safetynet.4502805/]]\nend note\n", True)
-        except Exception as e:
-            print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Encountered an error while opening a link")
-            traceback.print_exc()
-        self._on_spin('stop')
-
-    # -----------------------------------------------
-    #                  _on_link1
-    # -----------------------------------------------
-    def _on_link1(self, event):
-        try:
-            self._on_spin('start')
-            webbrowser.open_new('https://github.com/kdrag0n/safetynet-fix/releases')
-            puml(f":Open Link;\nnote right\n=== kdrag0n's Universal Safetynet Fix\n[[https://github.com/kdrag0n/safetynet-fix/releases]]\nend note\n", True)
-        except Exception as e:
-            print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Encountered an error while opening a link")
-            traceback.print_exc()
-        self._on_spin('stop')
-
-    # -----------------------------------------------
-    #                  _on_link2
-    # -----------------------------------------------
-    def _on_link2(self, event):
-        try:
-            self._on_spin('start')
-            webbrowser.open_new('https://github.com/Displax/safetynet-fix/releases')
-            puml(f":Open Link;\nnote right\n=== Displax's Universal Safetynet Fix\n[[https://github.com/Displax/safetynet-fix/releases]]\nend note\n", True)
-        except Exception as e:
-            print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Encountered an error while opening a link")
-            traceback.print_exc()
-        self._on_spin('stop')
-
-    # -----------------------------------------------
-    #                  _on_link3 (USB Drivers)
-    # -----------------------------------------------
-    def _on_link3(self, event):
-        try:
-            self._on_spin('start')
-            webbrowser.open_new('https://developer.android.com/studio/run/win-usb?authuser=1%2F')
-            puml(f":Open Link;\nnote right\n=== Google USB Driver\n[[https://developer.android.com/studio/run/win-usb?authuser=1%2F]]\nend note\n", True)
-        except Exception as e:
-            print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Encountered an error while opening a link")
-            traceback.print_exc()
-        self._on_spin('stop')
-
-    # -----------------------------------------------
-    #                  _on_link4 (Security Bulletin)
-    # -----------------------------------------------
-    def _on_link4(self, event):
-        try:
-            self._on_spin('start')
-            webbrowser.open_new('https://source.android.com/docs/security/bulletin/')
-            puml(f":Open Link;\nnote right\n=== Android security bulletins\n[[https://source.android.com/docs/security/bulletin/]]\nend note\n", True)
-        except Exception as e:
-            print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Encountered an error while opening a link")
-            traceback.print_exc()
         self._on_spin('stop')
 
     # -----------------------------------------------
@@ -1684,7 +1881,7 @@ class PixelFlasher(wx.Frame):
     def toast(self, title, message):
         if self.config.show_notifications:
             notification = wx.adv.NotificationMessage(title, message, parent=None, flags=wx.ICON_INFORMATION)
-            notification.SetIcon(images.Icon_256.GetIcon())
+            notification.SetIcon(images.Icon_dark_256.GetIcon())
             notification.Show()
 
     # -----------------------------------------------
@@ -1704,19 +1901,23 @@ class PixelFlasher(wx.Frame):
         self._on_spin('stop')
 
     # -----------------------------------------------
+    #                  _on_cancel_ota
+    # -----------------------------------------------
+    def _on_cancel_ota(self, event):
+        self._on_spin('start')
+        timestr = time.strftime('%Y-%m-%d_%H-%M-%S')
+        print(f"{datetime.now():%Y-%m-%d %H:%M:%S} User Pressed Cancel OTA Update")
+        device = get_phone()
+        device.reset_ota_update()
+        self._on_spin('stop')
+
+    # -----------------------------------------------
     #                  Test
     # -----------------------------------------------
     def Test(self, event):
         print("Entrering Test function (used during development only) ...")
         # device = get_phone()
         # device.dump_props()
-        # self._on_pif_manager(None)
-        # res = device.scrcpy()
-        # start_time = time.time()
-        # self.update_widget_states()
-        # end_time = time.time()
-        # elapsed_time = end_time - start_time
-        # print(f"The function update_widget_states took {elapsed_time} seconds to execute.")
 
     # -----------------------------------------------
     #                  _advanced_options_hide
@@ -1922,8 +2123,10 @@ class PixelFlasher(wx.Frame):
                     alert += "    WARNING! WARNING! WARNING!       There is a mismatch of currently selected vbmeta verity state and device's verity state\n"
                 if ( device.vbmeta.verification_a == self.config.disable_verification ) or ( device.vbmeta.verification_b == self.config.disable_verification ):
                     alert += "    WARNING! WARNING! WARNING!       There is a mismatch of currently selected vbmeta verification state and device's verification state\n"
-                    alert += "                                     This has a device wipe implications, please double check."
+                    alert += "                                     This has a device wipe implications, please double check.\n"
                 message += alert
+                if alert != '':
+                    self.toast("vbmeta Warning!", alert)
             return message
         except Exception as e:
             print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Encountered while getting vbmeta data.")
@@ -2003,38 +2206,44 @@ class PixelFlasher(wx.Frame):
     #                  _select_configured_device
     # -----------------------------------------------
     def _select_configured_device(self):
-        if self.config.device:
-            count = 0
-            for device in get_phones():
-                if device.id == self.config.device:
-                    self.device_choice.Select(count)
-                    set_phone_id(device.id)
-                    puml(f":Select Device;\n", True)
-                    self._print_device_details(device)
-                count += 1
-        elif self.device_choice.StringSelection:
-            device = self.device_choice.StringSelection
-            # replace multiple spaces with a single space and then split on space
-            id = ' '.join(device.split())
-            id = id.split()
-            id = id[2]
-            self.config.device = id
-            for device in get_phones():
-                if device.id == id:
-                    set_phone_id(device.id)
-                    puml(f":Select Device;\n", True)
-                    self._print_device_details(device)
-        else:
-            set_phone_id(None)
-            self.device_label.Label = "ADB Connected Devices"
-        if self.device_choice.StringSelection == '':
-            set_phone_id(None)
-            self.device_label.Label = "ADB Connected Devices"
-            self.config.device = None
-            print(f"{datetime.now():%Y-%m-%d %H:%M:%S} No Device is selected!")
-            puml(f":Select Device;\nnote right:No Device is selected!\n")
-        self._reflect_slots()
-        self.update_widget_states()
+        try:
+            if self.config.device:
+                count = 0
+                for device in get_phones():
+                    if device.id == self.config.device:
+                        self.device_choice.Select(count)
+                        set_phone_id(device.id)
+                        puml(f":Select Device;\n", True)
+                        self._print_device_details(device)
+                        self.update_google_images_menu()
+                    count += 1
+            elif self.device_choice.StringSelection:
+                device = self.device_choice.StringSelection
+                # replace multiple spaces with a single space and then split on space
+                id = ' '.join(device.split())
+                id = id.split()
+                id = id[2]
+                self.config.device = id
+                for device in get_phones():
+                    if device.id == id:
+                        set_phone_id(device.id)
+                        puml(f":Select Device;\n", True)
+                        self._print_device_details(device)
+                        self.update_google_images_menu()
+            else:
+                set_phone_id(None)
+                self.device_label.Label = "ADB Connected Devices"
+            if self.device_choice.StringSelection == '':
+                set_phone_id(None)
+                self.device_label.Label = "ADB Connected Devices"
+                self.config.device = None
+                print(f"{datetime.now():%Y-%m-%d %H:%M:%S} No Device is selected!")
+                puml(f":Select Device;\nnote right:No Device is selected!\n")
+            self._reflect_slots()
+            self.update_widget_states()
+        except Exception as e:
+            print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Encountered an error in function _select_configured_device")
+            traceback.print_exc()
 
     # -----------------------------------------------
     #                  refresh_device
@@ -2242,6 +2451,7 @@ class PixelFlasher(wx.Frame):
                 self.pif_info_menu_item:                ['device_attached'],
                 self.props_as_json_menu_item:           ['device_attached'],
                 self.xml_view_menu_item:                ['device_attached'],
+                self.cancel_ota_menu_item:              ['device_attached'],
                 self.push_menu:                         ['device_attached'],
                 self.push_file_to_tmp_menu:             ['device_attached'],
                 self.push_file_to_download_menu:        ['device_attached'],
@@ -2352,9 +2562,11 @@ class PixelFlasher(wx.Frame):
                 d_id = d_id[2]
                 self.config.device = d_id
                 for device in get_phones():
+                    wx.YieldIfNeeded()
                     if device.id == d_id:
                         set_phone_id(device.id)
                         self._print_device_details(device)
+                        self.update_google_images_menu()
                 self._reflect_slots()
             self.update_widget_states()
         except Exception as e:
@@ -2367,7 +2579,9 @@ class PixelFlasher(wx.Frame):
     # -----------------------------------------------
     def _on_scan(self, event):
         try:
-            print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} User initiated Scan")
+            print("\n==============================================================================")
+            print(f" {datetime.now():%Y-%m-%d %H:%M:%S} User initiated Scan")
+            print("==============================================================================")
             if get_adb():
                 print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} Scanning for Devices ...")
                 puml(":Scan for Devices;\n")
@@ -2416,12 +2630,14 @@ class PixelFlasher(wx.Frame):
         self._on_spin('stop')
 
     # -----------------------------------------------
-    #                  _on_select_firmware
+    #            update_firmware_selection
     # -----------------------------------------------
-    def _on_select_firmware(self, event):
+    def update_firmware_selection(self, path):
         try:
-            self.config.firmware_path = event.GetPath().replace("'", "")
-            self._on_spin('start')
+            if not os.path.exists(path):
+                print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: file {path} does not exist")
+                return -1
+            self.config.firmware_path = path.replace("'", "")
             checksum = select_firmware(self)
             if len(checksum) == 64:
                 self.config.firmware_sha256 = checksum
@@ -2432,6 +2648,18 @@ class PixelFlasher(wx.Frame):
         except Exception as e:
             print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Encountered an error while selecting firmware")
             traceback.print_exc()
+
+    # -----------------------------------------------
+    #                  _on_select_firmware
+    # -----------------------------------------------
+    def _on_select_firmware(self, event):
+        # path = event.GetPath()
+        path = self.firmware_picker.GetPath()
+        if not path:
+            # User cancelled the selecteion
+            return
+        self._on_spin('start')
+        self.update_firmware_selection(path)
         self._on_spin('stop')
 
     # -----------------------------------------------
@@ -2439,7 +2667,9 @@ class PixelFlasher(wx.Frame):
     # -----------------------------------------------
     def _on_process_firmware(self, event):
         try:
-            print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} User initiated Process firmware")
+            print("\n==============================================================================")
+            print(f" {datetime.now():%Y-%m-%d %H:%M:%S} User initiated Process firmware")
+            print("==============================================================================")
             self._on_spin('start')
             if self.config.firmware_path:
                 process_file(self, 'firmware')
@@ -2454,7 +2684,9 @@ class PixelFlasher(wx.Frame):
     # -----------------------------------------------
     def _on_process_rom(self, event):
         try:
-            print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} User initiated Process ROM")
+            print("\n==============================================================================")
+            print(f" {datetime.now():%Y-%m-%d %H:%M:%S} User initiated Process ROM")
+            print("==============================================================================")
             self._on_spin('start')
             if self.config.custom_rom_path:
                 process_file(self, 'rom')
@@ -2699,7 +2931,9 @@ class PixelFlasher(wx.Frame):
     # -----------------------------------------------
     def _on_reboot_recovery(self, event):
         try:
-            print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} User initiated Reboot Recovery")
+            print("\n==============================================================================")
+            print(f" {datetime.now():%Y-%m-%d %H:%M:%S} User initiated Reboot Recovery")
+            print("==============================================================================")
             if self.config.device:
                 self._on_spin('start')
                 device = get_phone()
@@ -2718,7 +2952,9 @@ class PixelFlasher(wx.Frame):
     # -----------------------------------------------
     def _on_reboot_download(self, event):
         try:
-            print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} User initiated Reboot Download")
+            print("\n==============================================================================")
+            print(f" {datetime.now():%Y-%m-%d %H:%M:%S} User initiated Reboot Download")
+            print("==============================================================================")
             if self.config.device:
                 self._on_spin('start')
                 device = get_phone()
@@ -2737,7 +2973,9 @@ class PixelFlasher(wx.Frame):
     # -----------------------------------------------
     def _on_reboot_sideload(self, event):
         try:
-            print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} User initiated Reboot Sideload")
+            print("\n==============================================================================")
+            print(f" {datetime.now():%Y-%m-%d %H:%M:%S} User initiated Reboot Sideload")
+            print("==============================================================================")
             if self.config.device:
                 self._on_spin('start')
                 device = get_phone()
@@ -2756,7 +2994,9 @@ class PixelFlasher(wx.Frame):
     # -----------------------------------------------
     def _on_reboot_safemode(self, event):
         try:
-            print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} User initiated Reboot Safe Mode")
+            print("\n==============================================================================")
+            print(f" {datetime.now():%Y-%m-%d %H:%M:%S} User initiated Reboot Safe Mode")
+            print("==============================================================================")
             if self.config.device:
                 self._on_spin('start')
                 device = get_phone()
@@ -2785,7 +3025,7 @@ class PixelFlasher(wx.Frame):
             device = get_phone()
             if device:
                 # push the file
-                res = device.push_file(selected_file, "/data/local/tmp/", False)
+                res = device.push_file(selected_file, destination, False)
                 if res != 0:
                     print(f"Return Code: {res.returncode}.")
                     print(f"Stdout: {res.stdout}")
@@ -2815,7 +3055,9 @@ class PixelFlasher(wx.Frame):
     # -----------------------------------------------
     def _on_reboot_system(self, event):
         try:
-            print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} User initiated Reboot System")
+            print("\n==============================================================================")
+            print(f" {datetime.now():%Y-%m-%d %H:%M:%S} User initiated Reboot System")
+            print("==============================================================================")
             if self.config.device:
                 self._on_spin('start')
                 device = get_phone()
@@ -2834,7 +3076,9 @@ class PixelFlasher(wx.Frame):
     # -----------------------------------------------
     def _on_reboot_bootloader(self, event):
         try:
-            print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} User initiated Reboot Bootloader")
+            print("\n==============================================================================")
+            print(f" {datetime.now():%Y-%m-%d %H:%M:%S} User initiated Reboot Bootloader")
+            print("==============================================================================")
             if self.config.device:
                 self._on_spin('start')
                 device = get_phone()
@@ -2853,7 +3097,9 @@ class PixelFlasher(wx.Frame):
     # -----------------------------------------------
     def _on_reboot_fastbootd(self, event):
         try:
-            print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} User initiated Reboot Fastbootd")
+            print("\n==============================================================================")
+            print(f" {datetime.now():%Y-%m-%d %H:%M:%S} User initiated Reboot Fastbootd")
+            print("==============================================================================")
             if self.config.device:
                 self._on_spin('start')
                 device = get_phone()
@@ -2871,7 +3117,9 @@ class PixelFlasher(wx.Frame):
     #                  _on_lock_bootloader
     # -----------------------------------------------
     def _on_lock_bootloader(self, event):
-        print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} User initiated Lock Bootloader")
+        print("\n==============================================================================")
+        print(f" {datetime.now():%Y-%m-%d %H:%M:%S} User initiated Lock Bootloader")
+        print("==============================================================================")
         if not self.config.device:
             return
         title = "Lock Bootloader"
@@ -2953,7 +3201,9 @@ class PixelFlasher(wx.Frame):
     #                  _on_unlock_bootloader
     # -----------------------------------------------
     def _on_unlock_bootloader(self, event):
-        print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} User initiated Unlock Bootloader")
+        print("\n==============================================================================")
+        print(f" {datetime.now():%Y-%m-%d %H:%M:%S} User initiated Unlock Bootloader")
+        print("==============================================================================")
         if not self.config.device:
             return
         title = "Unlock Bootloader"
@@ -3006,7 +3256,9 @@ class PixelFlasher(wx.Frame):
     #                  _on_sos
     # -----------------------------------------------
     def _on_sos(self, event):
-        print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} User initiated SOS")
+        print("\n==============================================================================")
+        print(f" {datetime.now():%Y-%m-%d %H:%M:%S} User initiated SOS")
+        print("==============================================================================")
         if not self.config.device:
             return
         title = "Disable Magisk Modules"
@@ -3047,7 +3299,9 @@ class PixelFlasher(wx.Frame):
     # -----------------------------------------------
     def _on_adb_shell(self, event):
         try:
-            print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} User initiated ADB Shell")
+            print("\n==============================================================================")
+            print(f" {datetime.now():%Y-%m-%d %H:%M:%S} User initiated ADB Shell")
+            print("==============================================================================")
             if self.config.device:
                 self._on_spin('start')
                 device = get_phone()
@@ -3062,7 +3316,9 @@ class PixelFlasher(wx.Frame):
     # -----------------------------------------------
     def _on_scrcpy(self, event):
         try:
-            print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} User initiated Scrcpy")
+            print("\n==============================================================================")
+            print(f" {datetime.now():%Y-%m-%d %H:%M:%S} User initiated Scrcpy")
+            print("==============================================================================")
             if self.config.device:
                 self._on_spin('start')
                 device = get_phone()
@@ -3111,12 +3367,10 @@ class PixelFlasher(wx.Frame):
 
         try:
             dlg = PifManager(parent=self, config=self.config)
-            dlg.CentreOnParent()
         except Exception:
             traceback.print_exc()
             self._on_spin('stop')
             return
-        dlg.CentreOnParent(wx.BOTH)
         self._on_spin('stop')
         result = dlg.Show()
 
@@ -3189,7 +3443,9 @@ class PixelFlasher(wx.Frame):
     # -----------------------------------------------
     def _on_switch_slot(self, event):
         try:
-            print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} User initiated Switch Slot")
+            print("\n==============================================================================")
+            print(f" {datetime.now():%Y-%m-%d %H:%M:%S} User initiated Switch Slot")
+            print("==============================================================================")
             if not self.config.device:
                 return
             device = get_phone()
@@ -3257,7 +3513,9 @@ class PixelFlasher(wx.Frame):
     # -----------------------------------------------
     def _on_adb_kill_server(self, event):
         try:
-            print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} User initiated ADB Kill")
+            print("\n==============================================================================")
+            print(f" {datetime.now():%Y-%m-%d %H:%M:%S} User initiated ADB Kill")
+            print("==============================================================================")
             dlg = wx.MessageDialog(None, "This will invoke the command adb kill-server.\nAre you sure want to continue?",'ADB Kill Server',wx.YES_NO | wx.ICON_EXCLAMATION)
             result = dlg.ShowModal()
             if result != wx.ID_YES:
@@ -3590,7 +3848,9 @@ class PixelFlasher(wx.Frame):
     # -----------------------------------------------
     def _on_live_boot(self, event):
         try:
-            print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} User initiated Live boot")
+            print("\n==============================================================================")
+            print(f" {datetime.now():%Y-%m-%d %H:%M:%S} User initiated Live boot")
+            print("==============================================================================")
             self._on_spin('start')
             live_flash_boot_phone(self, 'Live')
         except Exception as e:
@@ -3603,7 +3863,9 @@ class PixelFlasher(wx.Frame):
     # -----------------------------------------------
     def _on_flash_boot(self, event):
         try:
-            print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} User initiated Flash Boot")
+            print("\n==============================================================================")
+            print(f" {datetime.now():%Y-%m-%d %H:%M:%S} User initiated Flash Boot")
+            print("==============================================================================")
             self._on_spin('start')
             live_flash_boot_phone(self, 'Flash')
         except Exception as e:
@@ -3652,7 +3914,9 @@ class PixelFlasher(wx.Frame):
     # -----------------------------------------------
     def _on_patch_boot(self, event):
         try:
-            print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} User initiated Patch boot")
+            print("\n==============================================================================")
+            print(f" {datetime.now():%Y-%m-%d %H:%M:%S} User initiated Patch boot")
+            print("==============================================================================")
             self._on_spin('start')
             patch_boot_img(self, False)
         except Exception as e:
@@ -3665,7 +3929,9 @@ class PixelFlasher(wx.Frame):
     # -----------------------------------------------
     def _on_patch_custom_boot(self, event):
         try:
-            print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} User initiated Custom Patch boot")
+            print("\n==============================================================================")
+            print(f" {datetime.now():%Y-%m-%d %H:%M:%S} User initiated Custom Patch boot")
+            print("==============================================================================")
             self._on_spin('start')
             patch_boot_img(self, True)
         except Exception as e:
@@ -3678,7 +3944,9 @@ class PixelFlasher(wx.Frame):
     # -----------------------------------------------
     def _on_flash(self, event):
         try:
-            print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} User initiated Flash Pixel Phone.")
+            print("\n==============================================================================")
+            print(f" {datetime.now():%Y-%m-%d %H:%M:%S} User initiated Flash Pixel Phone.")
+            print("==============================================================================")
             self.spinner_label.Label = "Please be patient ...\n\nDuring this process:\n ! Do not touch the device\n ! Do not unplug your device"
             self._on_spin('start')
             self.flash_button.Enable(False)
@@ -3757,6 +4025,16 @@ class PixelFlasher(wx.Frame):
         except Exception as e:
             print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Encountered an error while updating root image")
             traceback.print_exc()
+
+    # -----------------------------------------------
+    #                  _on_show_device_download
+    # -----------------------------------------------
+    def _on_show_device_download(self, event):
+        device = get_phone()
+        if not device:
+            return
+        menu = GoogleImagesPopupMenu(self, device=device.hardware, date_filter=device.firmware_date)
+        self.PopupMenu(menu)
 
     #-----------------------------------------------------------------------------
     #                                   _init_ui
@@ -3848,14 +4126,11 @@ class PixelFlasher(wx.Frame):
 
         # 5th row widgets, firmware file
         firmware_label = wx.StaticText(parent=panel, label=u"Device Image")
-        firmware_button = DropDownButton(parent=panel, id=wx.ID_ANY, bitmap=wx.NullBitmap, pos=wx.DefaultPosition, size=wx.DefaultSize, style=wx.BU_AUTODRAW)
-        firmware_button.SetBitmap(images.open_link_24.GetBitmap())
-        firmware_button.SetToolTip(u"Download image file for Pixel devices.")
-        firmware_button.AddLink("Full OTA Images for Pixel Phones / Tablets", FULL_OTA_IMAGES_FOR_PIXEL_DEVICES, images.phone_green_24.GetBitmap())
-        firmware_button.AddLink("Factory Images for Pixel Phones / Tablets", FACTORY_IMAGES_FOR_PIXEL_DEVICES, images.phone_blue_24.GetBitmap())
-        firmware_button.AddLink("Full OTA Images for Pixel Watches", FULL_OTA_IMAGES_FOR_WATCH_DEVICES, images.watch_green_24.GetBitmap())
-        firmware_button.AddLink("Factory Images for Pixel Watches", FACTORY_IMAGES_FOR_WATCH_DEVICES, images.watch_blue_24.GetBitmap())
-        self.firmware_picker = wx.FilePickerCtrl(parent=panel, id=wx.ID_ANY, path=wx.EmptyString, message=u"Select a file", wildcard=u"Factory Image files (*.zip;*.tgz;*.tar)|*.zip;*.tgz;*.tar", pos=wx.DefaultPosition, size=wx.DefaultSize, style=wx.FLP_USE_TEXTCTRL)
+        self.firmware_button = wx.BitmapButton(parent=panel, id=wx.ID_ANY, bitmap=wx.NullBitmap, pos=wx.DefaultPosition, size=wx.DefaultSize, style=wx.BU_AUTODRAW)
+        self.firmware_button.SetBitmap(images.open_link_24.GetBitmap())
+        self.firmware_button.SetToolTip(u"Download image file for current Pixel device.")
+        # self.firmware_picker = wx.FilePickerCtrl(parent=panel, id=wx.ID_ANY, path=wx.EmptyString, message=u"Select a file", wildcard=u"Factory Image files (*.zip;*.tgz;*.tar)|*.zip;*.tgz;*.tar", pos=wx.DefaultPosition, size=wx.DefaultSize, style=wx.FLP_USE_TEXTCTRL)
+        self.firmware_picker = FilePickerComboBox(parent=panel, dialog_title="Select a file", wildcard="Factory Image files (*.zip;*.tgz;*.tar)|*.zip;*.tgz;*.tar")
         self.firmware_picker.SetToolTip(u"Select Pixel Firmware")
         self.process_firmware = wx.Button(parent=panel, id=wx.ID_ANY, label=u"Process", pos=wx.DefaultPosition, size=wx.DefaultSize, style=0)
         self.process_firmware.SetBitmap(images.process_file_24.GetBitmap())
@@ -3863,7 +4138,7 @@ class PixelFlasher(wx.Frame):
         firmware_label_sizer = wx.BoxSizer(orient=wx.HORIZONTAL)
         firmware_label_sizer.Add(window=firmware_label, proportion=0, flag=wx.ALL, border=5)
         firmware_label_sizer.AddStretchSpacer(1)
-        firmware_label_sizer.Add(window=firmware_button, proportion=0, flag=wx.ALL|wx.ALIGN_CENTER_VERTICAL, border=0)
+        firmware_label_sizer.Add(window=self.firmware_button, proportion=0, flag=wx.ALL|wx.ALIGN_CENTER_VERTICAL, border=0)
         self.firmware_sizer = wx.BoxSizer(orient=wx.HORIZONTAL)
         self.firmware_sizer.Add(window=self.firmware_picker, proportion=1, flag=wx.EXPAND)
         self.firmware_sizer.Add(window=self.process_firmware, flag=wx.LEFT, border=5)
@@ -4148,9 +4423,23 @@ class PixelFlasher(wx.Frame):
         self.Bind(wx.EVT_CLOSE, self._on_close)
         self.Bind(wx.EVT_SIZE, self._on_resize)
         self.Bind(wx.EVT_MOVE_END, self._on_move_end)
+        self.Bind(wx.EVT_BUTTON, self._on_show_device_download, self.firmware_button)
 
         # Update UI
         self.Layout()
+
+
+    # -----------------------------------------------
+    #                  update_google_images_menu
+    # -----------------------------------------------
+    def update_google_images_menu(self):
+        self.google_images_menu.reset_menu_id()
+        menu_index = self.menuBar.FindMenu("Google Images")
+        self.menuBar.Remove(menu_index)
+        self.google_images_menu = GoogleImagesMenu(self)
+        self.menuBar.Insert(menu_index, self.google_images_menu, "Google Images")
+        self.Refresh()
+        self.Update()
 
 
 # ============================================================================
