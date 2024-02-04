@@ -75,6 +75,11 @@ class Config():
         self.check_for_disk_space = True
         self.check_for_bootloader_unlocked = True
         self.check_for_firmware_hash_validity = True
+        self.google_images_update_frequency = 1
+        self.google_images_last_checked = None
+        self.enable_dg_clean = False
+        self.enable_bulk_prop = False
+        self.enable_pixel_img_process = False
 
         self.toolbar = {
             'tb_position': 'top',
@@ -104,6 +109,18 @@ class Config():
                 'unlock_bootloader': True,
                 'configuration': True
             }
+        }
+
+        self.pif = {
+            'auto_update_pif_json': False,
+            'auto_check_play_integrity': False,
+            'test_app_index': 0,
+            'disable_uiautomator': False,
+            'auto_fill': False,
+            'force_first_api': False,
+            'first_api_value_when_forced': "25",
+            'sort_keys': True,
+            'keep_unknown': True
         }
 
         self.scrcpy = {
@@ -236,6 +253,17 @@ class Config():
                     conf.check_for_bootloader_unlocked = data['check_for_bootloader_unlocked']
                 with contextlib.suppress(KeyError):
                     conf.check_for_firmware_hash_validity = data['check_for_firmware_hash_validity']
+                with contextlib.suppress(KeyError):
+                    conf.google_images_update_frequency = data['google_images_update_frequency']
+                with contextlib.suppress(KeyError):
+                    conf.google_images_last_checked = data['google_images_last_checked']
+                with contextlib.suppress(KeyError):
+                    conf.enable_dg_clean = data['enable_dg_clean']
+                with contextlib.suppress(KeyError):
+                    conf.enable_bulk_prop = data['enable_bulk_prop']
+                with contextlib.suppress(KeyError):
+                    conf.enable_pixel_img_process = data['enable_pixel_img_process']
+
                 # read the toolbar section
                 with contextlib.suppress(KeyError):
                     toolbar_data = data['toolbar']
@@ -291,6 +319,28 @@ class Config():
                         conf.toolbar['visible']['unlock_bootloader'] = toolbar_data['visible']['unlock_bootloader']
                     with contextlib.suppress(KeyError):
                         conf.toolbar['visible']['configuration'] = toolbar_data['visible']['configuration']
+
+                    # read the pif section
+                    pif_data = data['pif']
+                    with contextlib.suppress(KeyError):
+                        conf.pif['auto_update_pif_json'] = pif_data['auto_update_pif_json']
+                    with contextlib.suppress(KeyError):
+                        conf.pif['auto_check_play_integrity'] = pif_data['auto_check_play_integrity']
+                    with contextlib.suppress(KeyError):
+                        conf.pif['test_app_index'] = pif_data['test_app_index']
+                    with contextlib.suppress(KeyError):
+                        conf.pif['disable_uiautomator'] = pif_data['disable_uiautomator']
+                    with contextlib.suppress(KeyError):
+                        conf.pif['auto_fill'] = pif_data['auto_fill']
+                    with contextlib.suppress(KeyError):
+                        conf.pif['force_first_api'] = pif_data['force_first_api']
+                    with contextlib.suppress(KeyError):
+                        conf.pif['first_api_value_when_forced'] = pif_data['first_api_value_when_forced']
+                    with contextlib.suppress(KeyError):
+                        conf.pif['sort_keys'] = pif_data['sort_keys']
+                    with contextlib.suppress(KeyError):
+                        conf.pif['keep_unknown'] = pif_data['keep_unknown']
+
                 # read the scrcpy section
                 scrcpy_folder = ''
                 with contextlib.suppress(KeyError):
@@ -382,7 +432,13 @@ class Config():
             'check_for_disk_space': self.check_for_disk_space,
             'check_for_bootloader_unlocked': self.check_for_bootloader_unlocked,
             'check_for_firmware_hash_validity': self.check_for_firmware_hash_validity,
+            'google_images_update_frequency': self.google_images_update_frequency,
+            'google_images_last_checked': self.google_images_last_checked,
+            'enable_dg_clean': self.enable_dg_clean,
+            'enable_bulk_prop': self.enable_bulk_prop,
+            'enable_pixel_img_process': self.enable_pixel_img_process,
             'toolbar': self.toolbar,  # Save the toolbar settings as well
+            'pif': self.pif,  # Save the pif settings as well
             'scrcpy': self.scrcpy  # Save the scrcpy settings as well
         }
         with open(file_path, 'w', encoding="ISO-8859-1", errors="replace", newline='\n') as f:

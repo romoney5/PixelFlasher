@@ -8,6 +8,7 @@ import hashlib
 import io
 import json
 import json5
+import math
 import ntpath
 import os
 import re
@@ -15,7 +16,6 @@ import shutil
 import signal
 import sqlite3 as sl
 import subprocess
-import ssl
 import sys
 import random
 import tarfile
@@ -29,8 +29,7 @@ from datetime import datetime
 from os import path
 from urllib.parse import urlparse
 import xml.etree.ElementTree as ET
-from urllib.request import urlopen
-
+from bs4 import BeautifulSoup
 
 import lz4.frame
 import requests
@@ -38,6 +37,7 @@ import wx
 from packaging.version import parse
 from platformdirs import *
 from constants import *
+import cProfile, pstats, io
 
 verbose = False
 adb = None
@@ -94,6 +94,7 @@ low_memory = False
 config = {}
 config_file_path = ''
 unlocked_devices = []
+window_shown = False
 
 # ============================================================================
 #                               Class Boot
@@ -187,6 +188,19 @@ def set_config(value):
     global config
     config = value
 
+# ============================================================================
+#                               Function get_window_shown
+# ============================================================================
+def get_window_shown():
+    global window_shown
+    return window_shown
+
+# ============================================================================
+#                               Function set_window_shown
+# ============================================================================
+def set_window_shown(value):
+    global window_shown
+    window_shown = value
 
 # ============================================================================
 #                               Function check_for_unlocked
@@ -224,11 +238,13 @@ def set_console_widget(widget):
 # ============================================================================
 def flush_output():
     global console_widget
-    wx.YieldIfNeeded()
+    if get_window_shown():
+        wx.YieldIfNeeded()
     if console_widget:
         sys.stdout.flush()
         wx.CallAfter(console_widget.Update)
-        wx.YieldIfNeeded()
+        if get_window_shown():
+            wx.YieldIfNeeded()
 
 
 # ============================================================================
@@ -407,10 +423,10 @@ def get_boot_images_dir():
 # ============================================================================
 def get_factory_images_dir():
     # factory_images only changed after version 5
-    if parse(VERSION) < parse('7.0.0'):
+    if parse(VERSION) < parse('9.0.0'):
         return 'factory_images'
     else:
-        return 'factory_images7'
+        return 'factory_images9'
 
 
 # ============================================================================
@@ -420,10 +436,10 @@ def get_pf_db():
     # we have different db schemas for each of these versions
     if parse(VERSION) < parse('4.0.0'):
         return 'PixelFlasher.db'
-    elif parse(VERSION) < parse('7.0.0'):
+    elif parse(VERSION) < parse('9.0.0'):
         return 'PixelFlasher4.db'
     else:
-        return 'PixelFlasher7.db'
+        return 'PixelFlasher9.db'
 
 
 # ============================================================================
@@ -1100,6 +1116,13 @@ def get_favorite_pifs_file_path():
 
 
 # ============================================================================
+#                      Function get_device_images_history_file_path
+# ============================================================================
+def get_device_images_history_file_path():
+    return os.path.join(get_config_path(), "device_images_history.json").strip()
+
+
+# ============================================================================
 #                               Function get_coords_file_path
 # ============================================================================
 def get_coords_file_path():
@@ -1264,8 +1287,10 @@ def check_archive_contains_file(archive_file_path, file_to_check, nested=False, 
 
         file_ext = os.path.splitext(archive_file_path)[1].lower()
 
-        if file_ext == '.zip':
+        if file_ext in ['.zip']:
             return check_zip_contains_file(archive_file_path, file_to_check, get_low_memory(), nested, is_recursive)
+        elif file_ext in ['.img']:
+            return check_img_contains_file(archive_file_path, file_to_check)
         elif file_ext in ['.tgz', '.gz', '.tar', '.md5']:
             return check_tar_contains_file(archive_file_path, file_to_check, nested, is_recursive)
         else:
@@ -1316,6 +1341,40 @@ def check_zip_contains_file_fast(zip_file_path, file_to_check, nested=False, is_
         print(f"Failed to check_zip_contains_file_fast. Reason: {e}")
         traceback.print_exc()
         return ''
+
+
+# ============================================================================
+#                               Function check_img_contains_file
+# ============================================================================
+def check_img_contains_file(img_file_path, file_to_check):
+    try:
+        result = subprocess.run([get_path_to_7z(), 'l', img_file_path], capture_output=True, text=True)
+
+        if "Unexpected end of archive" in result.stderr:
+            print(f"Warning: Unexpected end of archive in {img_file_path}")
+            return []
+
+        file_list = result.stdout.split('\n')
+
+        matches = []
+        for line in file_list:
+            columns = line.split()
+            if len(columns) < 6:  # Skip lines with less than 6 columns
+                continue
+            file_path = columns[5].replace('\\\\', '\\')
+            if file_path.endswith(file_to_check):
+                debug(f"Found: {file_path}\n")
+                # matches.append(file_path)
+                return file_path
+
+        if not matches:
+            debug(f"file: {file_to_check} was NOT found\n")
+
+        return matches
+    except Exception as e:
+        print(f"Failed to check_img_contains_file. Reason: {e}")
+        traceback.print_exc()
+        return []
 
 
 # ============================================================================
@@ -1969,16 +2028,19 @@ def check_module_update(url):
             print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Module update not found for URL: {url}")
             return -1
         response.raise_for_status()
-        data = response.json()
-        mu = ModuleUpdate(url)
-        setattr(mu, 'version', data['version'])
-        setattr(mu, 'versionCode', data['versionCode'])
-        setattr(mu, 'zipUrl', data['zipUrl'])
-        setattr(mu, 'changelog', data['changelog'])
-        headers = {}
-        response = requests.request("GET", mu.changelog, headers=headers, data=payload)
-        setattr(mu, 'changelog', response.text)
-        return mu
+        with contextlib.suppress(Exception):
+            data = response.json()
+            mu = ModuleUpdate(url)
+            setattr(mu, 'version', data['version'])
+            setattr(mu, 'versionCode', data['versionCode'])
+            setattr(mu, 'zipUrl', data['zipUrl'])
+            setattr(mu, 'changelog', data['changelog'])
+            headers = {}
+            response = requests.request("GET", mu.changelog, headers=headers, data=payload)
+            setattr(mu, 'changelog', response.text)
+            return mu
+        print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Module update URL has issues, inform the module author: {url}")
+        return -1
     except Exception as e:
         print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Exception during getUpdateDetails url: {url} processing")
         traceback.print_exc()
@@ -2033,28 +2095,199 @@ def get_printable_memory():
 
 
 # ============================================================================
+#                               Function device_has_update
+# ============================================================================
+def device_has_update(data, device_id, target_date):
+    if not data:
+        return False
+    if device_id in data:
+        device_data = data[device_id]
+
+        for download_type in ['ota', 'factory']:
+            for download_entry in device_data[download_type]:
+                download_date = download_entry['date']
+                # Compare the download date with the target date
+                if download_date > target_date:
+                    return True
+    return False
+
+
+# ============================================================================
+#                               Function get_google_images
+# ============================================================================
+def get_google_images(save_to=None):
+    COOKIE = {'Cookie': 'devsite_wall_acks=nexus-ota-tos,nexus-image-tos,watch-image-tos,watch-ota-tos'}
+    data = {}
+
+    if save_to is None:
+        save_to = os.path.join(get_config_path(), "google_images.json").strip()
+
+    for image_type in ['ota', 'factory', 'ota-watch', 'factory-watch']:
+        if image_type == 'ota':
+            url = "https://developers.google.com/android/ota"
+            download_type = "ota"
+            device_type = "phone"
+        elif image_type == 'factory':
+            url = "https://developers.google.com/android/images"
+            download_type = "factory"
+            device_type = "phone"
+        elif image_type == 'ota-watch':
+            url = "https://developers.google.com/android/ota-watch"
+            download_type = "ota"
+            device_type = "watch"
+        elif image_type == 'factory-watch':
+            url = "https://developers.google.com/android/images-watch"
+            download_type = "factory"
+            device_type = "watch"
+
+        try:
+            response = requests.get(url, headers=COOKIE)
+            html = response.content
+        except requests.exceptions.SSLError:
+            # Retry with SSL certificate verification disabled
+            print(f"WARNING! Encountered SSL certification error while connecting to: {url}")
+            print("Retrying with SSL certificate verification disabled. ...")
+            print("For security, you should double check and make sure your system or communication is not compromised.")
+            response = requests.get(url, headers=COOKIE, verify=False)
+            html = response.content
+        soup = BeautifulSoup(html, 'html.parser')
+        marlin_flag = False
+
+        # Find all the <h2> elements containing device names
+        device_elements = soup.find_all('h2')
+
+        # Iterate through the device elements
+        for device_element in device_elements:
+            # Check if the text of the <h2> element should be skipped
+            if device_element.text.strip() in ["Terms and conditions", "Updating instructions", "Updating Pixel 6, Pixel 6 Pro, and Pixel 6a devices to Android 13 for the first time", "Use Android Flash Tool", "Flashing instructions"]:
+                continue
+
+            # Extract the device name from the 'id' attribute
+            device_id = device_element.get('id')
+
+            # Extract the device label from the text and strip "id"
+            device_label = device_element.get('data-text').strip('"').split('" for ')[1]
+
+            # Initialize a dictionary to store the device's downloads for both OTA and Factory
+            downloads_dict = {'ota': [], 'factory': []}
+
+            # Find the <table> element following the <h2> for each device
+            table = device_element.find_next('table')
+
+            # Find all <tr> elements in the table
+            rows = table.find_all('tr')
+
+            # For factory images, the table format changes from Marlin onwards
+            if device_id == 'marlin':
+                marlin_flag = True
+
+            for row in rows:
+                # Extract the fields from each <tr> element
+                columns = row.find_all('td')
+                version = columns[0].text.strip()
+
+                # Different extraction is necessary per type
+                if image_type in ['ota', 'ota-watch'] or (marlin_flag and image_type == "factory"):
+                    sha256_checksum = columns[2].text.strip()
+                    download_url = columns[1].find('a')['href']
+                elif image_type in ['factory', 'factory-watch']:
+                    download_url = columns[2].find('a')['href']
+                    sha256_checksum = columns[3].text.strip()
+
+                date_match = re.search(r'\b(\d{6})\b', version)
+                date = None
+                if date_match:
+                    date = date_match[1]
+                else:
+                    date = extract_date_from_google_version(version)
+
+                # Create a dictionary for each download
+                download_info = {
+                    'version': version,
+                    'url': download_url,
+                    'sha256': sha256_checksum,
+                    'date': date
+                }
+
+                # Check if the download entry already exists, and only add it if it's a new entry
+                if download_info not in downloads_dict[download_type]:
+                    downloads_dict[download_type].append(download_info)
+
+            # Add the device name (using 'device_id') and device label (using 'device_label') to the data dictionary
+            if device_id not in data:
+                data[device_id] = {
+                    'label': device_label,
+                    'type': device_type,
+                    'ota': [],
+                    'factory': []
+                }
+
+            # Append the downloads to the corresponding list based on download_type
+            data[device_id]['ota'].extend(downloads_dict['ota'])
+            data[device_id]['factory'].extend(downloads_dict['factory'])
+
+    # Convert to JSON
+    json_data = json.dumps(data, indent=2)
+
+    # Save
+    with open(save_to, 'w', encoding='utf-8') as json_file:
+        json_file.write(json_data)
+
+
+# ============================================================================
+#                         extract_date_from_google_version
+# ============================================================================
+def extract_date_from_google_version(version_string):
+    # pattern to find a 3-letter month followed by a year
+    pattern = re.compile(r'(\b[A-Za-z]{3}\s\d{4}\b)')
+    match = pattern.search(version_string)
+
+    if match:
+        date_str = match.group()
+        date_obj = datetime.strptime(date_str, '%b %Y')
+        # convert to yymm01
+        return date_obj.strftime('%y%m01')
+    return None
+
+
+# ============================================================================
 #                               Function download_file
 # ============================================================================
-def download_file(url, filename = None):
-    if url:
-        print (f"Downloading File: {url}")
-        try:
-            response = requests.get(url)
-            config_path = get_config_path()
-            if not filename:
-                filename = os.path.basename(urlparse(url).path)
-            downloaded_file_path = os.path.join(config_path, 'tmp', filename)
-            open(downloaded_file_path, "wb").write(response.content)
-            # check if filename got downloaded
-            if not os.path.exists(downloaded_file_path):
-                print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Failed to download file from  {url}\n")
-                print("Aborting ...\n")
-                return 'ERROR'
-        except Exception:
-            print (f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Failed to download file from  {url}\n")
-            traceback.print_exc()
+def download_file(url, filename=None, callback=None):
+    if not url:
+        return
+    print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} Downloading: {url} ...")
+    start = time.time()
+    try:
+        response = requests.get(url)
+    except requests.exceptions.SSLError:
+        # Retry with SSL certificate verification disabled
+        print(f"WARNING! Encountered SSL certification error while connecting to: {url}")
+        print("Retrying with SSL certificate verification disabled. ...")
+        print("For security, you should double check and make sure your system or communication is not compromised.")
+        response = requests.get(url, verify=False)
+
+    try:
+        config_path = get_config_path()
+        if not filename:
+            filename = os.path.basename(urlparse(url).path)
+        downloaded_file_path = os.path.join(config_path, 'tmp', filename)
+        open(downloaded_file_path, "wb").write(response.content)
+        # check if filename got downloaded
+        if not os.path.exists(downloaded_file_path):
+            print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Failed to download file from  {url}\n")
+            print("Aborting ...\n")
             return 'ERROR'
-    return downloaded_file_path
+        end = time.time()
+        print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} Download: {filename} completed! in {math.ceil(end - start)} seconds")
+        # Call the callback function if provided
+        if callback:
+            callback()
+        return downloaded_file_path
+    except Exception:
+        print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Failed to download file from  {url}\n")
+        traceback.print_exc()
+        return 'ERROR'
 
 
 # ============================================================================
@@ -2068,6 +2301,261 @@ def get_first_match(dictionary, keys):
     else:
         value = ''
     return value
+
+
+# ============================================================================
+#                               Function delete_keys_from_dict
+# ============================================================================
+def delete_keys_from_dict(dictionary, keys):
+    for key in keys:
+        if key in dictionary:
+            del dictionary[key]
+    return dictionary
+
+
+# ============================================================================
+#                               Function process_dict
+# ============================================================================
+def process_dict(the_dict, add_missing_keys=False, advanced_props_support=False, set_first_api=None, sort_data=False, keep_all=False):
+    try:
+        android_devices = get_android_devices()
+        autofill = False
+        if add_missing_keys:
+            device = get_phone()
+            if device:
+                device_dict = device.props.property
+                autofill = True
+            else:
+                print("ERROR: Device is unavilable to add missing fields from device.")
+
+        # FINGERPRINT
+        fp_ro_product_brand = ''
+        fp_ro_product_name = ''
+        fp_ro_product_device = ''
+        fp_ro_build_version_release = ''
+        fp_ro_build_id = ''
+        fp_ro_build_version_incremental = ''
+        fp_ro_build_type = ''
+        fp_ro_build_tags = ''
+        keys = ['ro.build.fingerprint', 'ro.system.build.fingerprint', 'ro.product.build.fingerprint', 'ro.vendor.build.fingerprint']
+        ro_build_fingerprint = get_first_match(the_dict, keys)
+        if ro_build_fingerprint != '':
+            the_dict = delete_keys_from_dict(the_dict, keys)
+        if autofill and ro_build_fingerprint == '':
+            ro_build_fingerprint = get_first_match(device_dict, keys)
+        if ro_build_fingerprint:
+            # Let's extract props from fingerprint in case we need them
+            pattern = r'([^\/]*)\/([^\/]*)\/([^:]*):([^\/]*)\/([^\/]*)\/([^:]*):([^\/]*)\/([^\/]*)$'
+            match = re.search(pattern, ro_build_fingerprint)
+            if match and match.lastindex == 8:
+                fp_ro_product_brand = match[1]
+                fp_ro_product_name = match[2]
+                fp_ro_product_device = match[3]
+                fp_ro_build_version_release = match[4]
+                fp_ro_build_id = match[5]
+                fp_ro_build_version_incremental = match[6]
+                fp_ro_build_type = match[7]
+                fp_ro_build_tags = match[8]
+
+        # PRODUCT
+        keys = ['ro.product.name', 'ro.product.system.name', 'ro.product.product.name', 'ro.product.vendor.name', 'ro.vendor.product.name']
+        ro_product_name = get_first_match(the_dict, keys)
+        if ro_product_name != '':
+            the_dict = delete_keys_from_dict(the_dict, keys)
+        if ro_product_name in [None, '', 'mainline', 'generic'] and fp_ro_product_name != '':
+            debug(f"Properties for PRODUCT are extracted from FINGERPRINT: {fp_ro_product_name}")
+            ro_product_name = fp_ro_product_name
+        if autofill and ro_product_name == '':
+            ro_product_name = get_first_match(device_dict, keys)
+
+        # DEVICE (ro.build.product os fallback, keep it last)
+        keys = ['ro.product.device', 'ro.product.system.device', 'ro.product.product.device', 'ro.product.vendor.device', 'ro.vendor.product.device', 'ro.build.product']
+        ro_product_device = get_first_match(the_dict, keys)
+        if ro_product_device != '':
+            the_dict = delete_keys_from_dict(the_dict, keys)
+        if ro_product_device in [None, '', 'mainline', 'generic'] and fp_ro_product_device != '':
+            debug(f"Properties for DEVICE are extracted from FINGERPRINT: {fp_ro_product_device}")
+            ro_product_device = fp_ro_product_device
+        if autofill and ro_product_device == '':
+            ro_product_device = get_first_match(device_dict, keys)
+
+        # MANUFACTURER
+        keys = ['ro.product.manufacturer', 'ro.product.system.manufacturer', 'ro.product.product.manufacturer', 'ro.product.vendor.manufacturer', 'ro.vendor.product.manufacturer']
+        ro_product_manufacturer = get_first_match(the_dict, keys)
+        if ro_product_manufacturer != '':
+            the_dict = delete_keys_from_dict(the_dict, keys)
+        if autofill and ro_product_manufacturer == '':
+            ro_product_manufacturer = get_first_match(device_dict, keys)
+
+        # BRAND
+        keys = ['ro.product.brand', 'ro.product.system.brand', 'ro.product.product.brand', 'ro.product.vendor.brand', 'ro.vendor.product.brand']
+        ro_product_brand = get_first_match(the_dict, keys)
+        if ro_product_brand != '':
+            the_dict = delete_keys_from_dict(the_dict, keys)
+        if (ro_product_brand is None or ro_product_brand == '') and fp_ro_product_brand != '':
+            debug(f"Properties for BRAND are not found, using value from FINGERPRINT: {fp_ro_product_brand}")
+            ro_product_brand = fp_ro_product_brand
+        if autofill and ro_product_brand == '':
+            ro_product_brand = get_first_match(device_dict, keys)
+
+        # MODEL
+        keys = ['ro.product.model', 'ro.product.system.model', 'ro.product.product.model', 'ro.product.vendor.model', 'ro.vendor.product.model']
+        ro_product_model = get_first_match(the_dict, keys)
+        if ro_product_model != '':
+            the_dict = delete_keys_from_dict(the_dict, keys)
+        if ro_product_model in ['mainline', 'generic'] and ro_product_manufacturer == 'Google':
+            # get model from android_devices if it is a Google device
+            # TODO: otherwise, or ideally from vendor/build.prop
+            ro_product_model = android_devices[ro_product_device]['device']
+        if autofill and ro_product_model == '':
+            ro_product_model = get_first_match(device_dict, keys)
+
+        # SECURITY_PATCH
+        keys = ['ro.build.version.security_patch', 'ro.vendor.build.security_patch']
+        ro_build_version_security_patch = get_first_match(the_dict, keys)
+        if ro_build_version_security_patch != '':
+            the_dict = delete_keys_from_dict(the_dict, keys)
+        if autofill and ro_build_version_security_patch == '':
+            ro_build_version_security_patch = get_first_match(device_dict, keys)
+
+        # FIRST_API_LEVEL
+        keys = ['ro.product.first_api_level', 'ro.board.first_api_level', 'ro.board.api_level', 'ro.build.version.sdk', 'ro.system.build.version.sdk', 'ro.build.version.sdk', 'ro.system.build.version.sdk', 'ro.vendor.build.version.sdk', 'ro.product.build.version.sdk']
+        if set_first_api:
+            ro_product_first_api_level = set_first_api
+        else:
+            ro_product_first_api_level = get_first_match(the_dict, keys)
+            if ro_product_first_api_level and int(ro_product_first_api_level) > 32:
+                ro_product_first_api_level = '32'
+            if autofill and ro_product_first_api_level == '':
+                ro_product_first_api_level = get_first_match(device_dict, keys)
+        if ro_product_first_api_level != '':
+            the_dict = delete_keys_from_dict(the_dict, keys)
+
+        # BUILD_ID
+        keys = ['ro.build.id']
+        ro_build_id = get_first_match(the_dict, keys)
+        if ro_build_id != '':
+            the_dict = delete_keys_from_dict(the_dict, keys)
+        if (ro_build_id is None or ro_build_id == '') and fp_ro_build_id != '':
+            debug(f"Properties for ID are not found, using value from FINGERPRINT: {fp_ro_build_id}")
+            ro_build_id = fp_ro_build_id
+        if autofill and ro_build_id == '':
+            ro_build_id = get_first_match(device_dict, keys)
+
+        # RELEASE
+        keys = ['ro.build.version.release']
+        ro_build_version_release = get_first_match(the_dict, keys)
+        if ro_build_version_release != '':
+            the_dict = delete_keys_from_dict(the_dict, keys)
+        if (ro_build_version_release is None or ro_build_version_release == '') and fp_ro_build_version_release != '':
+            debug(f"Properties for RELEASE are not found, using value from FINGERPRINT: {fp_ro_build_version_release}")
+            ro_build_version_release = fp_ro_build_version_release
+        if autofill and ro_build_version_release == '':
+            ro_build_version_release = get_first_match(device_dict, keys)
+
+        # INCREMENTAL
+        keys = ['ro.build.version.incremental']
+        ro_build_version_incremental = get_first_match(the_dict, keys)
+        if ro_build_version_incremental != '':
+            the_dict = delete_keys_from_dict(the_dict, keys)
+        if (ro_build_version_incremental is None or ro_build_version_incremental == '') and fp_ro_build_version_incremental != '':
+            debug(f"Properties for INCREMENTAL are not found, using value from FINGERPRINT: {fp_ro_build_version_incremental}")
+            ro_build_version_incremental = fp_ro_build_version_incremental
+        if autofill and ro_build_version_incremental == '':
+            ro_build_version_incremental = get_first_match(device_dict, keys)
+
+        # TYPE
+        keys = ['ro.build.type']
+        ro_build_type = get_first_match(the_dict, keys)
+        if ro_build_type != '':
+            the_dict = delete_keys_from_dict(the_dict, keys)
+        if (ro_build_type is None or ro_build_type == '') and fp_ro_build_type != '':
+            debug(f"Properties for TYPE are not found, using value from FINGERPRINT: {fp_ro_build_type}")
+            ro_build_type = fp_ro_build_type
+        if autofill and ro_build_type == '':
+            ro_build_type = get_first_match(device_dict, keys)
+
+        # TAGS
+        keys = ['ro.build.tags']
+        ro_build_tags = get_first_match(the_dict, keys)
+        if ro_build_tags != '':
+            the_dict = delete_keys_from_dict(the_dict, keys)
+        if (ro_build_tags is None or ro_build_tags == '') and fp_ro_build_tags != '':
+            debug(f"Properties for TAGS are not found, using value from FINGERPRINT: {fp_ro_build_tags}")
+            ro_build_tags = fp_ro_build_tags
+        if autofill and ro_build_tags == '':
+            ro_build_tags = get_first_match(device_dict, keys)
+
+        # VNDK_VERSION
+        keys = ['ro.vndk.version', 'ro.product.vndk.version']
+        ro_vndk_version = get_first_match(the_dict, keys)
+        if ro_vndk_version != '':
+            the_dict = delete_keys_from_dict(the_dict, keys)
+        if autofill and ro_vndk_version == '':
+            ro_vndk_version = get_first_match(device_dict, keys)
+
+        # Get any missing FINGERPRINT fields
+        ffp_ro_product_brand = fp_ro_product_brand if fp_ro_product_brand != '' else ro_product_brand
+        ffp_ro_product_name = fp_ro_product_name if fp_ro_product_name != '' else ro_product_name
+        ffp_ro_product_device = fp_ro_product_device if fp_ro_product_device != '' else ro_product_device
+        ffp_ro_build_version_release = fp_ro_build_version_release if fp_ro_build_version_release != '' else ro_build_version_release
+        ffp_ro_build_id = fp_ro_build_id if fp_ro_build_id != '' else ro_build_id
+        ffp_ro_build_version_incremental = fp_ro_build_version_incremental if fp_ro_build_version_incremental != '' else ro_build_version_incremental
+        ffp_ro_build_type = fp_ro_build_type if fp_ro_build_type != '' else ro_build_type
+        ffp_ro_build_tags = fp_ro_build_tags if fp_ro_build_tags != '' else ro_build_tags
+        # Rebuild the FINGERPRINT
+        if ffp_ro_product_brand and ffp_ro_product_name and ffp_ro_product_device and ffp_ro_build_version_release and ffp_ro_build_id and ffp_ro_build_version_incremental and ffp_ro_build_type and ffp_ro_build_tags:
+            ro_build_fingerprint = f"{ffp_ro_product_brand}/{ffp_ro_product_name}/{ffp_ro_product_device}:{ffp_ro_build_version_release}/{ffp_ro_build_id}/{ffp_ro_build_version_incremental}:{ffp_ro_build_type}/{ffp_ro_build_tags}"
+
+        donor_data = {
+            "PRODUCT": ro_product_name,
+            "DEVICE": ro_product_device,
+            "MANUFACTURER": ro_product_manufacturer,
+            "BRAND": ro_product_brand,
+            "MODEL": ro_product_model,
+            "FINGERPRINT": ro_build_fingerprint,
+            "SECURITY_PATCH": ro_build_version_security_patch
+        }
+        if advanced_props_support:
+            donor_data["DEVICE_INITIAL_SDK_INT"] = ro_product_first_api_level
+            donor_data["*api_level"] = ro_product_first_api_level
+            donor_data["*.security_patch"] = ro_build_version_security_patch
+            donor_data["ID"] = ro_build_id
+            donor_data["*.build.id"] = ro_build_id
+            donor_data["RELEASE"] = ro_build_version_release
+            donor_data["INCREMENTAL"] = ro_build_version_incremental
+            donor_data["TYPE"] = ro_build_type
+            donor_data["TAGS"] = ro_build_tags
+            donor_data["*.vndk_version"] = ro_vndk_version
+            donor_data["VERBOSE_LOGS"] = "0"
+        else:
+            donor_data["FIRST_API_LEVEL"] = ro_product_first_api_level
+            donor_data["BUILD_ID"] = ro_build_id
+            donor_data["ID"] = ro_build_id
+            donor_data["VNDK_VERSION"] = ro_vndk_version
+            donor_data["FORCE_BASIC_ATTESTATION"] = "true"
+            donor_data["KERNEL"] = "Goolag-perf"
+
+        # Discard keys with empty values if the flag is set
+        if advanced_props_support:
+            modified_donor_data = {key: value for key, value in donor_data.items() if value != ""}
+        else:
+            modified_donor_data = donor_data
+
+        # Keep unknown props if the flag is set
+        if keep_all:
+            for key, value in the_dict.items():
+                if key not in modified_donor_data:
+                    modified_donor_data[key] = value
+
+        if not sort_data:
+            return json.dumps(modified_donor_data, indent=4)
+        sorted_donor_data = dict(sorted(modified_donor_data.items()))
+        return json.dumps(sorted_donor_data, indent=4)
+    except Exception as e:
+        print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Exception in function process_dict.")
+        traceback.print_exc()
+        return ''
 
 
 # ============================================================================
@@ -2386,18 +2874,20 @@ def xiaomi_xml_to_json(decoded_xml, json_path=None):
         # Extract key-value pairs under android.os.Build
         build_data = {}
         build_class = root.find(".//class[@name='android.os.Build']")
-        for field in build_class.iter("field"):
-            field_name = field.get("name")
-            field_value = field.get("value")
-            build_data[field_name] = field_value
+        if build_class:
+            for field in build_class.iter("field"):
+                field_name = field.get("name")
+                field_value = field.get("value")
+                build_data[field_name] = field_value
 
         # Extract key-value pairs under android.os.Build$VERSION
         version_data = {}
         version_class = root.find(".//class[@name='android.os.Build$VERSION']")
-        for field in version_class.iter("field"):
-            field_name = field.get("name")
-            field_value = field.get("value")
-            version_data[field_name] = field_value
+        if version_class:
+            for field in version_class.iter("field"):
+                field_name = field.get("name")
+                field_value = field.get("value")
+                version_data[field_name] = field_value
 
         # Flatten the key-value pairs
         flattened_data = {**build_data, **version_data}
@@ -2473,70 +2963,164 @@ def get_xiaomi_pif():  # sourcery skip: move-assign
 
 
 # ============================================================================
-#                               Function run_shell
+#                               Function get_freeman_pif
 # ============================================================================
 def get_freeman_pif(abi_list=None):
     print("\n===== PIFS Random Profile/Fingerprint Picker =====\nCopyright (C) MIT License 2023 Nicholas Bissell (TheFreeman193)")
 
-    config_path = get_config_path()
-    tmp_dir_full = os.path.join(config_path, 'tmp')
-    freeman_dir_full = os.path.join(config_path, 'TheFreeman193_JSON')
-    zip_file = os.path.join(tmp_dir_full, 'PIFS.zip')
+    try:
+        config_path = get_config_path()
+        tmp_dir_full = os.path.join(config_path, 'tmp')
+        freeman_dir_full = os.path.join(config_path, 'TheFreeman193_JSON')
+        zip_file = os.path.join(tmp_dir_full, 'PIFS.zip')
 
-    if not os.path.exists(freeman_dir_full):
-        if not os.path.exists(zip_file):
-            print("Downloading profile/fingerprint repo from GitHub...")
-            d_url = FREEMANURL
-            try:
-                # Try making the request with SSL certificate verification
+        if not os.path.exists(freeman_dir_full):
+            if not os.path.exists(zip_file):
+                print("Downloading profile/fingerprint repo from GitHub...")
                 download_file(FREEMANURL, zip_file)
-                # with urlopen(d_url) as response, open(zip_file, 'wb') as out_file:
-                #     shutil.copyfileobj(response, out_file)
-            except ssl.SSLCertVerificationError:
-                # Retry with SSL certificate verification disabled
-                print(f"WARNING! Encountered SSL certification error while downloading from: {FREEMANURL}")
-                print("Attempting to download with SSL certificate verification disabled.")
-                print("For security you should double check and make sure your system or communication is not compromised.")
-                ssl_context = ssl.create_default_context()
-                ssl_context.check_hostname = False
-                ssl_context.verify_mode = ssl.CERT_NONE
-                with urlopen(d_url, context=ssl_context) as response, open(zip_file, 'wb') as out_file:
-                    shutil.copyfileobj(response, out_file)
+            temp_dir = tempfile.mkdtemp()
+            with zipfile.ZipFile(zip_file, 'r') as zip_ref:
+                zip_ref.extractall(temp_dir)
+            # Move the extracted 'JSON' directory contents directly to the target directory
+            json_contents_path = os.path.join(temp_dir, "PIFS-main", "JSON")
+            shutil.move(json_contents_path, freeman_dir_full)
+            # Remove the temporary directory
+            shutil.rmtree(temp_dir)
 
-        temp_dir = tempfile.mkdtemp()
-        with zipfile.ZipFile(zip_file, 'r') as zip_ref:
-            zip_ref.extractall(temp_dir)
-        # Move the extracted 'JSON' directory contents directly to the target directory
-        json_contents_path = os.path.join(temp_dir, "PIFS-main", "JSON")
-        shutil.move(json_contents_path, freeman_dir_full)
-        # Remove the temporary directory
-        shutil.rmtree(temp_dir)
+        if abi_list:
+            if abi_list == "arm64-v8a":
+                abi_list = "arm64-v8a,armeabi-v7a,armeabi"
+            print(f"Will use profile/fingerprint with ABI list '{abi_list}'")
+            file_list = [os.path.join(root, file) for root, dirs, files in os.walk(f"{freeman_dir_full}/{abi_list}") for file in files]
+        else:
+            print("Couldn't detect ABI list. Will use profile/fingerprint from anywhere.")
+            file_list = [os.path.join(root, file) for root, dirs, files in os.walk(f"{freeman_dir_full}") for file in files]
 
-    if abi_list:
-        print(f"Will use profile/fingerprint with ABI list '{abi_list}'")
-        file_list = [os.path.join(root, file) for root, dirs, files in os.walk(f"{freeman_dir_full}/{abi_list}") for file in files]
-    else:
-        print("Couldn't detect ABI list. Will use profile/fingerprint from anywhere.")
-        file_list = [os.path.join(root, file) for root, dirs, files in os.walk(f"{freeman_dir_full}") for file in files]
+            if not file_list:
+                print("Couldn't find any profiles/fingerprints. Is the JSON directory empty?")
+                return
 
-        if not file_list:
-            print("Couldn't find any profiles/fingerprints. Is the JSON directory empty?")
+        f_count = len(file_list)
+        debug(f"Matching json count: {f_count}")
+        if f_count == 0:
+            print("Couldn't parse JSON file list!")
             return
 
-    f_count = len(file_list)
-    debug(f"Matching json count: {f_count}")
-    if f_count == 0:
-        print("Couldn't parse JSON file list!")
-        return
+        print("Picking a random profile/fingerprint...")
+        random_fp_num = random.randint(1, f_count)
+        rand_fp = file_list[random_fp_num - 1]
 
-    print("Picking a random profile/fingerprint...")
-    random_fp_num = random.randint(1, f_count)
-    rand_fp = file_list[random_fp_num - 1]
+        print(f"\nRandom profile/fingerprint file: '{os.path.basename(rand_fp)}'\n")
+        with open(rand_fp, "r") as file:
+            json_content = json.load(file)
+            return json.dumps(json_content, indent=4)
 
-    print(f"\nRandom profile/fingerprint file: '{os.path.basename(rand_fp)}'\n")
-    with open(rand_fp, "r") as file:
-        json_content = json.load(file)
-        return json.dumps(json_content, indent=4)
+    except Exception as e:
+        print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Encountered an error in get_freeman_pif function")
+        traceback.print_exc()
+
+
+# ============================================================================
+#                               Function get_pif_from_image
+# ============================================================================
+def get_pif_from_image(image_file):
+    try:
+        config_path = get_config_path()
+        path_to_7z = get_path_to_7z()
+        temp_dir = tempfile.TemporaryDirectory()
+        temp_dir_path = temp_dir.name
+
+        file_to_process = image_file
+        found_flash_all_bat = check_archive_contains_file(archive_file_path=file_to_process, file_to_check="flash-all.bat", nested=False)
+        found_flash_all_sh = check_archive_contains_file(archive_file_path=file_to_process, file_to_check="flash-all.sh", nested=False)
+        if found_flash_all_bat and found_flash_all_sh:
+            # assume Pixel factory file
+            package_sig = found_flash_all_bat.split('/')[0]
+            if not package_sig:
+                print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Could not extract package signature from {found_flash_all_bat}")
+                return
+            package_dir_full = os.path.join(temp_dir_path, package_sig)
+            image_file_path = os.path.join(package_dir_full, f"image-{package_sig}.zip")
+            # Unzip the factory image
+            debug(f"Unzipping Image: {file_to_process} into {package_dir_full} ...")
+            theCmd = f"\"{path_to_7z}\" x -bd -y -o\"{temp_dir_path}\" \"{file_to_process}\""
+            debug(theCmd)
+            res = run_shell2(theCmd)
+            if res.returncode != 0:
+                print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Could not extract {file_to_process}")
+                print(f"Return Code: {res.returncode}.")
+                print(f"Stdout: {res.stdout}.")
+                print(f"Stderr: {res.stderr}.")
+                print("Aborting ...\n")
+                return
+
+            # create props folder
+            props_folder = os.path.join(config_path, "props")
+            props_path = os.path.join(props_folder, package_sig)
+            if os.path.exists(props_path):
+                shutil.rmtree(props_path)
+            os.makedirs(props_path, exist_ok=True)
+
+            # check if image file is included and contains what we need
+            if os.path.exists(image_file_path):
+                # process system.img
+                found_system_img = check_archive_contains_file(archive_file_path=image_file_path, file_to_check="system.img", nested=False, is_recursive=False)
+                if found_system_img:
+                    print(f"Extracting system.img from {image_file_path} ...")
+                    theCmd = f"\"{path_to_7z}\" x -bd -y -o\"{package_dir_full}\" \"{image_file_path}\" system.img"
+                    debug(theCmd)
+                    res = run_shell2(theCmd)
+                    img_archive = os.path.join(package_dir_full, "system.img")
+                    found_system_build_prop = check_archive_contains_file(archive_file_path=img_archive, file_to_check="build.prop", nested=False, is_recursive=False)
+                    if found_system_build_prop:
+                        print(f"Extracting build.prop from {img_archive} ...")
+                        theCmd = f"\"{path_to_7z}\" x -bd -y -o\"{props_path}\" \"{img_archive}\" {found_system_build_prop}"
+                        debug(theCmd)
+                        res = run_shell2(theCmd)
+                    if os.path.exists(os.path.join(props_path, found_system_build_prop)):
+                        os.rename(os.path.join(props_path, found_system_build_prop), os.path.join(props_path, "system-build.prop"))
+
+                # process vendor.img
+                found_vendor_img = check_archive_contains_file(archive_file_path=image_file_path, file_to_check="vendor.img", nested=False, is_recursive=False)
+                if found_vendor_img:
+                    print(f"Extracting system.img from {image_file_path} ...")
+                    theCmd = f"\"{path_to_7z}\" x -bd -y -o\"{package_dir_full}\" \"{image_file_path}\" vendor.img"
+                    debug(theCmd)
+                    res = run_shell2(theCmd)
+                    img_archive = os.path.join(package_dir_full, "vendor.img")
+                    found_vendor_build_prop = check_archive_contains_file(archive_file_path=img_archive, file_to_check="build.prop", nested=False, is_recursive=False)
+                    if found_vendor_build_prop:
+                        print(f"Extracting build.prop from {img_archive} ...")
+                        theCmd = f"\"{path_to_7z}\" x -bd -y -o\"{props_path}\" \"{img_archive}\" {found_vendor_build_prop}"
+                        debug(theCmd)
+                        res = run_shell2(theCmd)
+                    if os.path.exists(os.path.join(props_path, found_vendor_build_prop)):
+                        os.rename(os.path.join(props_path, found_vendor_build_prop), os.path.join(props_path, "vendor-build.prop"))
+
+                # process product.img
+                found_product_img = check_archive_contains_file(archive_file_path=image_file_path, file_to_check="product.img", nested=False, is_recursive=False)
+                if found_product_img:
+                    print(f"Extracting system.img from {image_file_path} ...")
+                    theCmd = f"\"{path_to_7z}\" x -bd -y -o\"{package_dir_full}\" \"{image_file_path}\" product.img"
+                    debug(theCmd)
+                    res = run_shell2(theCmd)
+                    img_archive = os.path.join(package_dir_full, "product.img")
+                    found_product_build_prop = check_archive_contains_file(archive_file_path=img_archive, file_to_check="build.prop", nested=False, is_recursive=False)
+                    if found_product_build_prop:
+                        print(f"Extracting build.prop from {img_archive} ...")
+                        theCmd = f"\"{path_to_7z}\" x -bd -y -o\"{props_path}\" \"{img_archive}\" {found_product_build_prop}"
+                        debug(theCmd)
+                        res = run_shell2(theCmd)
+                    if os.path.exists(os.path.join(props_path, found_product_build_prop)):
+                        os.rename(os.path.join(props_path, found_product_build_prop), os.path.join(props_path, "product-build.prop"))
+
+                # return path to props folder
+                return props_path
+    except Exception as e:
+        print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Encountered an error while processing ota/firmware file:")
+        traceback.print_exc()
+    finally:
+        temp_dir.cleanup()
 
 
 # ============================================================================
@@ -2554,8 +3138,8 @@ def run_shell(cmd, timeout=None):
         # Return the response
         return subprocess.CompletedProcess(args=cmd, returncode=process.returncode, stdout=stdout, stderr=stderr)
     except subprocess.TimeoutExpired as e:
-        print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Command timed out after {timeout} seconds")
-        puml("#red:Command timed out;\n", True)
+        print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Command {cmd} timed out after {timeout} seconds")
+        puml("#red:Command {cmd} timed out;\n", True)
         puml(f"note right\n{e}\nend note\n")
         # Send CTRL + C signal to the process
         process.send_signal(signal.SIGTERM)
@@ -2563,7 +3147,7 @@ def run_shell(cmd, timeout=None):
         return subprocess.CompletedProcess(args=cmd, returncode=-1, stdout='', stderr='')
 
     except Exception as e:
-        print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Encountered an error while executing run_shell")
+        print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Encountered an error while executing run_shell {cmd}")
         traceback.print_exc()
         puml("#red:Encountered an error;\n", True)
         puml(f"note right\n{e}\nend note\n")
@@ -2593,19 +3177,37 @@ def run_shell2(cmd, timeout=None, detached=False, directory=None):
                 break
             if timeout is not None and time.time() > timeout:
                 proc.terminate()
-                print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Command timed out after {timeout} seconds")
+                print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Command {cmd} timed out after {timeout} seconds")
                 puml("#red:Command timed out;\n", True)
-                puml(f"note right\nCommand timed out after {timeout} seconds\nend note\n")
+                puml(f"note right\nCommand {cmd} timed out after {timeout} seconds\nend note\n")
                 return subprocess.CompletedProcess(args=cmd, returncode=-1, stdout='', stderr='')
         proc.wait()
         # Wait for the process to complete and capture the output
         stdout, stderr = proc.communicate()
         return subprocess.CompletedProcess(args=cmd, returncode=proc.returncode, stdout=stdout, stderr=stderr)
     except Exception as e:
-        print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Encountered an error while executing run_shell2")
+        print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Encountered an error while executing run_shell2 {cmd}")
         traceback.print_exc()
         puml("#red:Encountered an error;\n", True)
         puml(f"note right\n{e}\nend note\n")
         raise e
         # return subprocess.CompletedProcess(args=cmd, returncode=-2, stdout='', stderr='')
 
+
+
+# def run_shell(*args, **kwargs):
+#     pr = cProfile.Profile()
+#     pr.enable()
+#     result = run_shell1(*args, **kwargs)  # Call your function here
+#     pr.disable()
+#     s = io.StringIO()
+#     ps = pstats.Stats(pr, stream=s).sort_stats('tottime')
+#     ps.print_stats()
+
+#     # Get the calling function and line number
+#     stack = traceback.extract_stack()
+#     filename, lineno, function_name, _ = stack[-3]  # -3 because -1 is current function, -2 is the function that called this function
+#     print(f"Called from {function_name} at {filename}:{lineno}")
+
+#     print(s.getvalue())
+#     return result

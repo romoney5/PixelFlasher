@@ -112,6 +112,10 @@ class Device():
         self._magisk_modules_summary = None
         self._magisk_apks = None
         self._magisk_config_path = None
+        self._apatch_version = None
+        self._apatch_app_version = None
+        self._apatch_version_code = None
+        self._apatch_app_version_code = None
         self._has_init_boot = None
         self.packages = {}
         self.backups = {}
@@ -255,10 +259,16 @@ class Device():
         """
         if self.mode == 'adb':
             if get_adb():
-                theCmd = f"\"{get_adb()}\" -s {self.id} shell /bin/getprop"
+                if self.rooted:
+                    theCmd = f"\"{get_adb()}\" -s {self.id} shell \"su -c \'/bin/getprop\'\""
+                else:
+                    theCmd = f"\"{get_adb()}\" -s {self.id} shell /bin/getprop"
                 device_info = run_shell(theCmd)
                 if device_info.returncode == 127:
-                    theCmd = f"\"{get_adb()}\" -s {self.id} shell getprop"
+                    if self.rooted:
+                        theCmd = f"\"{get_adb()}\" -s {self.id} shell \"su -c \'getprop\'\""
+                    else:
+                        theCmd = f"\"{get_adb()}\" -s {self.id} shell getprop"
                     device_info = run_shell(theCmd)
                 return ''.join(device_info.stdout)
             else:
@@ -417,6 +427,17 @@ class Device():
     #                               property api_level
     # ----------------------------------------------------------------------------
     @property
+    def firmware_date(self):
+        if self.build:
+            build_date_match = re.search(r'\b(\d{6})\b', self.build.lower())
+            if build_date_match:
+                build_date = build_date_match[1]
+                return int(build_date)
+
+    # ----------------------------------------------------------------------------
+    #                               property api_level
+    # ----------------------------------------------------------------------------
+    @property
     def api_level(self):
         return self.get_prop('ro.build.version.sdk')
 
@@ -485,12 +506,17 @@ class Device():
     # ----------------------------------------------------------------------------
     @property
     def magisk_path(self):
-        if self.mode == 'adb' and get_magisk_package():
-            res = self.get_package_path(get_magisk_package(), True)
-            if res != -1:
-                return res
-            self._rooted = None
-            return None
+        try:
+            if self.mode == 'adb' and get_magisk_package():
+                res = self.get_package_path(get_magisk_package(), True)
+                if res != -1:
+                    return res
+                self._rooted = None
+                return None
+        except Exception:
+            print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Could not get magisk path")
+            traceback.print_exc()
+        return None
 
     # ----------------------------------------------------------------------------
     #                               property magisk_version
@@ -560,19 +586,7 @@ class Device():
     # ----------------------------------------------------------------------------
     @property
     def current_device_print(self):
-        device_data = {
-            "PRODUCT": self.get_prop('ro.product.name'),
-            "DEVICE": self.get_prop('ro.product.device'),
-            "MANUFACTURER": self.get_prop('ro.product.manufacturer'),
-            "BRAND": self.get_prop('ro.product.brand'),
-            "MODEL": self.get_prop('ro.product.model'),
-            "FINGERPRINT": self.ro_build_fingerprint,
-            "SECURITY_PATCH": self.get_prop('ro.build.version.security_patch'),
-            "FIRST_API_LEVEL": self.get_prop('ro.product.first_api_level'),
-            "BUILD_ID": self.get_prop('ro.build.id'),
-            "VNDK_VERSION": self.get_prop('ro.vndk.version')
-        }
-        return json.dumps(device_data, indent=4)
+        return process_dict(self.props.property, True, True)
 
     # ----------------------------------------------------------------------------
     #                               property current_device_props_in_json
@@ -621,11 +635,11 @@ class Device():
         if not self.rooted:
             return -1
 
-        res = self.push_avbctl()
-        if res != 0:
-            return -1
-
         try:
+            res = self.push_avbctl()
+            if res != 0:
+                return -1
+
             theCmd = f"\"{get_adb()}\" -s {self.id} shell \"su -c \'/data/local/tmp/avbctl get-{item}\'\""
             print(f"Checking {item} status: ...")
             res = run_shell(theCmd)
@@ -639,6 +653,38 @@ class Device():
             traceback.print_exc()
             print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Could not get {item} status.")
             puml(f"#red:ERROR: Could not get {item} status.;\n", True)
+            return -1
+
+    # ----------------------------------------------------------------------------
+    #                               method reset_ota_update
+    # ----------------------------------------------------------------------------
+    def reset_ota_update(self):
+        if self.mode != 'adb':
+            return -1
+        if not self.rooted:
+            return -1
+
+        try:
+            res = self.push_update_engine_client()
+            if res != 0:
+                return -1
+
+            print("Cancelling onging OTA update (if one is in progress, ignore errors) ...")
+            theCmd = f"\"{get_adb()}\" -s {self.id} shell \"su -c \'/data/local/tmp/update_engine_client --cancel\'\""
+            res = run_shell2(theCmd)
+            print("Resetting an already applied update (if one exists) ...")
+            theCmd = f"\"{get_adb()}\" -s {self.id} shell \"su -c \'/data/local/tmp/update_engine_client --reset_status\'\""
+            res = run_shell2(theCmd)
+            if res.returncode == 0:
+                return res.stdout
+            print(f"Return Code: {res.returncode}.")
+            print(f"Stdout: {res.stdout}")
+            print(f"Stderr: {res.stderr}")
+            return -1
+        except Exception as e:
+            traceback.print_exc()
+            print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Encountered an exception if reset_ota_update function.")
+            puml(f"#red:ERROR: Encountered an exception if reset_ota_update function.;\n", True)
             return -1
 
     # ----------------------------------------------------------------------------
@@ -1654,6 +1700,32 @@ add_hosts_module
             traceback.print_exc()
 
     # ----------------------------------------------------------------------------
+    #                               Method push_update_engine_client
+    # ----------------------------------------------------------------------------
+    def push_update_engine_client(self, file_path = "/data/local/tmp/update_engine_client") -> int:
+        try:
+            # Transfer extraction script to the phone
+            if self.architecture in ['armeabi-v7a', 'arm64-v8a']:
+                path_to_update_engine_client = os.path.join(get_bundle_dir(),'bin', 'update_engine_client')
+                res = self.push_file(f"{path_to_update_engine_client}", f"{file_path}")
+                if res != 0:
+                    print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Could not push {file_path}")
+                    return -1
+                # set the permissions.
+                res = self.set_file_permissions(f"{file_path}", "755")
+                if res != 0:
+                    print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Could not set permission on {file_path}")
+                    return -1
+                return 0
+            else:
+                print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: update_engine_client is not available for device architecture: {self.architecture}")
+                return -1
+        except Exception as e:
+            print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Encountered an error while pushing update_engine_client")
+            puml("#red:Encountered an error while pushing update_engine_client;\n")
+            traceback.print_exc()
+
+    # ----------------------------------------------------------------------------
     #                               Method get_package_path
     # ----------------------------------------------------------------------------
     def get_package_path(self, pkg: str, check_details = True) -> str:
@@ -1826,29 +1898,42 @@ add_hosts_module
     @property
     def magisk_app_version(self):
         if self._magisk_app_version is None and self.mode == 'adb' and get_magisk_package():
+            self._magisk_app_version, self._magisk_app_version_code = self.get_app_version(get_magisk_package())
+        return self._magisk_app_version
+
+    # ----------------------------------------------------------------------------
+    #                               property apatch_app_version
+    # ----------------------------------------------------------------------------
+    @property
+    def apatch_app_version(self):
+        if self._apatch_app_version is None and self.mode == 'adb':
+            self._apatch_app_version, self._apatch_app_version_code = self.get_app_version('me.bmax.apatch')
+        return self._apatch_app_version
+
+    # ----------------------------------------------------------------------------
+    #                               method app_version
+    # ----------------------------------------------------------------------------
+    def get_app_version(self, pkg):
+        version = ''
+        versionCode = ''
+        if pkg and self.mode == 'adb':
             try:
-                theCmd = f"\"{get_adb()}\" -s {self.id} shell dumpsys package {get_magisk_package()}"
+                theCmd = f"\"{get_adb()}\" -s {self.id} shell dumpsys package {pkg}"
                 res = run_shell(theCmd)
                 data = res.stdout.split('\n')
-                version = None
-                versionCode = None
                 for line in data:
                     if re.search('versionCode', line):
                         versionCode = line.split('=')
                         versionCode = versionCode[1]
                         versionCode = versionCode.split(' ')
                         versionCode = versionCode[0]
-                        self._magisk_app_version_code = versionCode
                     if re.search('versionName', line):
                         version = line.split('=')
                         version = version[1]
             except Exception:
-                return ''
-            if version and versionCode:
-                self._magisk_app_version = f"{str(version)}:{str(versionCode)}"
-            else:
-                self._magisk_app_version = ''
-        return self._magisk_app_version
+                return '', ''
+        # return version, versionCode
+        return f"{str(version)}:{str(versionCode)}", versionCode
 
     # ----------------------------------------------------------------------------
     #                               property magisk_app_version_code
@@ -1861,11 +1946,28 @@ add_hosts_module
             return self._magisk_app_version_code
 
     # ----------------------------------------------------------------------------
+    #                               property apatch_app_version_code
+    # ----------------------------------------------------------------------------
+    @property
+    def apatch_app_version_code(self):
+        if self._apatch_app_version_code is None:
+            return ''
+        else:
+            return self._apatch_app_version_code
+
+    # ----------------------------------------------------------------------------
     #                               Method get_uncached_magisk_app_version
     # ----------------------------------------------------------------------------
     def get_uncached_magisk_app_version(self):
         self._magisk_app_version = None
         return self.magisk_app_version
+
+    # ----------------------------------------------------------------------------
+    #                               Method get_uncached_apatch_app_version
+    # ----------------------------------------------------------------------------
+    def get_uncached_apatch_app_version(self):
+        self._apatch_app_version = None
+        return self.apatch_app_version
 
     # ----------------------------------------------------------------------------
     #                               Method is_display_unlocked
@@ -1907,9 +2009,13 @@ add_hosts_module
     #                               Method stop_magisk
     # ----------------------------------------------------------------------------
     def stop_magisk(self):
-        print("Stopping Magisk ...")
-        with contextlib.suppress(Exception):
-            self.perform_package_action(get_magisk_package(), 'kill')
+        try:
+            print("Stopping Magisk ...")
+            with contextlib.suppress(Exception):
+                self.perform_package_action(get_magisk_package(), 'kill')
+        except Exception as e:
+            print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Exception during stop_magisk")
+            traceback.print_exc()
 
     # ----------------------------------------------------------------------------
     #                               method get_magisk_detailed_modules
@@ -2523,11 +2629,13 @@ This is a special Magisk build\n\n
         try:
             if not device_id:
                 device_id = self.id
-            retry_text = f"retry [{retry}] times" if retry > 0 else ''
+            retry_text = f"retry [{retry + 1}] times" if retry > 0 else ''
             print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} Getting device: {device_id} state {retry_text} ...")
             puml(f":Getting device: {device_id} state {retry_text};\n", True)
-            for _ in range(retry + 1):
+            for i in range(retry + 1):
                 if get_adb():
+                    puml(f":Getting device: {device_id} state [{i + 1}/{retry + 1}] using get-state;\n", True)
+                    debug(f":Getting device: {device_id} state [{i + 1}/{retry + 1}] using get-state")
                     theCmd = f"\"{get_adb()}\" -s {device_id} get-state"
                     debug(theCmd)
                     res = run_shell(theCmd, timeout=timeout)
@@ -2541,6 +2649,8 @@ This is a special Magisk build\n\n
                             puml(f"note right:State {state};\n")
                             return state
                 if get_fastboot():
+                    puml(f":Getting device: {device_id} state [{i + 1}/{retry + 1}] using fastboot devices;\n", True)
+                    debug(f":Getting device: {device_id} state [{i + 1}/{retry + 1}] using fastboot devices")
                     theCmd = f"\"{get_fastboot()}\" devices"
                     res = run_shell(theCmd, timeout=timeout)
                     if res.returncode == 0 and device_id in res.stdout:
@@ -2562,8 +2672,8 @@ This is a special Magisk build\n\n
         try:
             if not device_id:
                 device_id = self.id
-            print(f"ADB waiting device: {device_id} for {wait_for} ...")
-            puml(f":ADB waiting device: {device_id} for {wait_for};\n", True)
+            print(f"ADB waiting for device: {device_id} for {wait_for} ...")
+            puml(f":ADB waiting for device: {device_id} for {wait_for};\n", True)
             if wait_for not in ['device', 'bootloader', 'sideload', 'recovery', 'rescue', 'disconnect']:
                 print(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} ERROR: Wrong wait-for [{wait_for}] request!")
                 puml(f"#red:ERROR: Wrong wait-for [{wait_for}] request;\n", True)
@@ -3201,7 +3311,7 @@ This is a special Magisk build\n\n
     #                               method perform_package_action
     # ----------------------------------------------------------------------------
     def perform_package_action(self, pkg, action, isSystem=False):
-        # possible actions 'uninstall', 'disable', 'enable', 'launch', 'kill', killall', 'clear-data', 'clear-cache', 'add-to-denylist', 'rm-from-denylist', 'optimize', 'reset-optimize'
+        # possible actions 'uninstall', 'disable', 'enable', 'launch', 'launch-am', 'launch-am-main', 'kill', killall', 'clear-data', 'clear-cache', 'add-to-denylist', 'rm-from-denylist', 'optimize', 'reset-optimize'
         if self.mode != 'adb':
             return
         if action in ['add-to-denylist', 'rm-from-denylist'] and get_magisk_package() == 'io.github.huskydg.magisk':
@@ -3225,10 +3335,14 @@ This is a special Magisk build\n\n
                     theCmd = f"\"{get_adb()}\" -s {self.id} shell pm enable {pkg}"
             elif action == 'launch':
                 theCmd = f"\"{get_adb()}\" -s {self.id} shell monkey -p {pkg} -c android.intent.category.LAUNCHER 1"
+            elif action == 'launch-am':
+                theCmd = f"\"{get_adb()}\" -s {self.id} shell am start -n {pkg}/{pkg}.MainActivity"
+            elif action == 'launch-am-main':
+                theCmd = f"\"{get_adb()}\" -s {self.id} shell am start -n {pkg}/{pkg}.main.MainActivity"
             elif action == 'kill':
                 theCmd = f"\"{get_adb()}\" -s {self.id} shell am force-stop {pkg}"
             elif action == 'killall':
-                theCmd = f"\"{get_adb()}\" -s {self.id} shell \"su -c \'killall {pkg}\'\""
+                theCmd = f"\"{get_adb()}\" -s {self.id} shell \"su -c \'killall -v {pkg}\'\""
             elif action == 'clear-data':
                 theCmd = f"\"{get_adb()}\" -s {self.id} shell pm clear {pkg}"
             elif action == 'clear-cache':
